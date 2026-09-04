@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# SpatialAnalyzer job/data files (real measurement data — not committed)
+*.xit
+*.xit64

@@ -1,0 +1,5 @@
+# MCP server runtime
+mcp[cli]>=1.0
+
+# Windows COM bridge to SpatialAnalyzer SDK
+pywin32>=306
