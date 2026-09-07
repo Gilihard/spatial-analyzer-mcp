@@ -1228,6 +1228,44 @@ def _resolve_point_source(point_group, collection, coordinates):
     return collection, point_group, build_info
 
 
+# SA's default geometry fit profile auto-creates a point group of "cardinal
+# points" (center/axis/etc. of the fitted shape) next to EVERY best-fit
+# geometry - on this localized SA 2015 named "<geometry name>Кардинальные
+# точки" (English SA: "<geometry name>Cardinal Points"). The 'Fit Geometry to
+# ...' steps expose no argument to turn this off, so the group is deleted
+# right after a successful fit.
+_CARDINAL_KEYWORDS = ("кардинальн", "cardinal", "к.т")
+
+
+def _purge_auto_cardinal_groups(collection, object_name):
+    """Delete the auto-created cardinal-points point group of a fit.
+
+    Only point groups whose name starts with the fitted object's name and ends
+    with a cardinal-points keyword are removed - a user's own unrelated groups
+    are never touched. Returns the list of deleted full names.
+    """
+    deleted = []
+    try:
+        names = _objects_in_collection_by_type(collection, "Point Group")
+    except Exception:  # noqa: BLE001 - enumeration unavailable
+        return deleted
+    low_base = object_name.lower()
+    doomed_full = []
+    doomed_local = []
+    for n in names:
+        local = str(n).split("::")[-1]
+        low = local.lower()
+        if not low.startswith(low_base):
+            continue
+        tail = low[len(low_base):]
+        if any(k in tail for k in _CARDINAL_KEYWORDS):
+            doomed_full.append(str(n))
+            doomed_local.append(local)
+    if doomed_local and _delete_geometry_objects(collection, doomed_local):
+        deleted = doomed_full
+    return deleted
+
+
 def _fit_geometry_report(geometry_type, object_name, collection, group,
                          build_info, fit_tolerance_mm=None,
                          ignore_out_of_tolerance=False):
@@ -1301,6 +1339,10 @@ def _fit_geometry_report(geometry_type, object_name, collection, group,
             report["error"] = ("'Fit Geometry to Point Group' returned "
                                f"{report['status']} (code {code}). The "
                                "geometry was NOT created.")
+        if report["constructed"]:
+            removed = _purge_auto_cardinal_groups(collection, object_name)
+            if removed:
+                report["cardinal_points_removed"] = removed
     except Exception as exc:  # noqa: BLE001
         report["error"] = str(exc)
     return report
@@ -2078,6 +2120,8 @@ def sa_fit_clean(
         except Exception:  # noqa: BLE001
             return False
 
+    cardinal_removed = []  # auto "cardinal points" groups purged per pass
+
     def _fit_into(full_names):
         # Fit the WHOLE group (None) or exactly the given points (list of
         # joined full names). The list variant 'Fit Geometry to Points' never
@@ -2105,10 +2149,18 @@ def sa_fit_clean(
             sa.set_bool_arg("Ignore Out of Tolerance Points", False)
             sa.execute_step()
             code = sa.get_step_result()
-            return {"constructed": code in (2, 4),
+            made = {"constructed": code in (2, 4),
                     "status_code": code,
                     "status": MP_STATUS.get(code, f"Unknown({code})"),
                     "messages": _safe_messages()}
+            if made["constructed"]:
+                # The default fit profile auto-creates a "<name>Кардинальные
+                # точки" group beside every fit - drop it so refits under the
+                # same name never accumulate cardinal points.
+                removed = _purge_auto_cardinal_groups(collection, object_name)
+                if removed:
+                    cardinal_removed.extend(removed)
+            return made
         except Exception as exc:  # noqa: BLE001
             return {"constructed": False, "error": str(exc)}
 
@@ -2305,6 +2357,7 @@ def sa_fit_clean(
         "final_stats_kept": last.get("stats_kept"),
         "deleted_outliers": deleted,
         "replaced_object": replaced,
+        "cardinal_points_removed": cardinal_removed,
         "error": None,
     }
 
@@ -2749,6 +2802,1591 @@ _wrap_specs = {
 }
 for _g, _doc in _wrap_specs.items():
     _fixed_wrapper(_g, _doc)
+
+
+# ---------------------------------------------------------------------------
+# Project points onto object(s) at the CLOSEST POINT
+#
+# GUI: Construct > Points > Project Points to > Objects > Closest Point.
+# SA 2015 has no dedicated single-step construct for the batch closest-point
+# projection - it is the Query engine with Projection Options whose output is
+# "Points on Object" (SA User Manual ch.20: "creates projected points on the
+# object to which the query is being performed"): 'Query Points to Objects'
+# projects a Point Name Ref List onto an Object Name Ref List and creates a
+# NEW POINT GROUP in the process instead of a deviation vector group. Step +
+# arg names are in "MP Command Reference" ch.6; the projection-type strings
+# below were read from the SA 2015 GUI binary (verified 2015.07.28_6769).
+# ---------------------------------------------------------------------------
+_PROJECTION_OUTPUT_TYPES = (
+    "Points on Object",  # closest point ON the object (projected points)
+    "Points on Offset Object",
+    "Points on Probe Surface",
+    "Offset Object To Target Vectors",
+    "Target To Offset Object Vectors",
+    "Object To Probe Vectors",
+    "Probe To Object Vectors",
+)
+
+_PROJECT_QUERY_STEP = "Query Points to Objects"
+_PROJECT_QUERY_POINT_ARG = "Point Names"
+_PROJECT_QUERY_OBJECTS_ARG = "Object Name List (Objects to Project to)"
+_PROJECT_QUERY_RESULT_ARG = "Resulting Object Name"
+_PROJECT_QUERY_OPTIONS_ARG = "Projection Options"
+_PROJECT_RMS_TOL_ARGS = ("RMS Tolerance (0.0 for none)", "RMS Tolerance")
+_PROJECT_MAX_TOL_ARGS = (
+    "Maximum Absolute Tolerance (0.0 for none)",
+    "Maximum Absolute Tolerance",
+)
+
+
+def _projection_sources(point_groups, points, group, collection):
+    """Resolve source groups/points into full "C::G::T" point names.
+
+    Every point group in `point_groups` is expanded via 'Make a Point Name Ref
+    List From a Group' (a 376-point group costs ~0.1 s); explicit `points`
+    entries pass through _point_full_name (bare targets resolve against
+    `group`). Returns {names, from_groups, error?}; names are deduplicated in
+    order.
+    """
+    res = {"names": [], "from_groups": [], "error": None}
+    seen = set()
+    try:
+        for pg in point_groups or []:
+            full_g = _object_full_name(pg, collection)
+            rel_names = _points_in_group(full_g)
+            coll_seg = "::".join(full_g.split("::")[:-1])  # "" when bare
+            for rel in rel_names:
+                # "C::G::1", or "::G::1" (leading empty segment) when the
+                # group lives in the current collection - the ref-list form.
+                full = "::".join([coll_seg, rel])
+                if full not in seen:
+                    seen.add(full)
+                    res["names"].append(full)
+            res["from_groups"].append(pg)
+        for p in points or []:
+            full = _point_full_name(p, group, collection)
+            if full not in seen:
+                seen.add(full)
+                res["names"].append(full)
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    if not res["names"] and not res["error"]:
+        res["error"] = ("No source points: give point_groups and/or points "
+                        "(they resolve to zero existing points).")
+    return res
+
+
+def _query_points_to_objects(point_names, object_names, collection,
+                             result_group, projection_type,
+                             ignore_edge_projections, use_stored_offsets,
+                             probe_offset_mm, extra_material_mm,
+                             rms_tolerance, max_abs_tolerance):
+    """Run 'Query Points to Objects' with the given projection options."""
+    sa.set_step(_PROJECT_QUERY_STEP)
+    sa.set_point_name_ref_list_arg(_PROJECT_QUERY_POINT_ARG, point_names)
+    sa.set_collection_object_name_ref_list_arg(_PROJECT_QUERY_OBJECTS_ARG,
+                                               object_names)
+    sa.set_collection_object_name_arg(_PROJECT_QUERY_RESULT_ARG, collection,
+                                      result_group)
+    # Offsets are overridden (bUseStoredOffsets=False) by default: with the
+    # stored per-point reflector offsets left in play SA 2015 often reports
+    # DoneFatalError on groups that carry them (т контур, Radial Offset 19.05)
+    # even though it still creates the points.
+    sa.set_projection_options_arg(
+        _PROJECT_QUERY_OPTIONS_ARG, projection_type,
+        bool(ignore_edge_projections), not bool(use_stored_offsets),
+        float(probe_offset_mm), float(extra_material_mm) != 0.0,
+        float(extra_material_mm))
+    _set_first_arg(sa.set_double_arg, _PROJECT_RMS_TOL_ARGS,
+                   float(rms_tolerance))
+    _set_first_arg(sa.set_double_arg, _PROJECT_MAX_TOL_ARGS,
+                   float(max_abs_tolerance))
+    sa.set_bool_arg("Show Results Dialog?", False)  # never pop the dialog
+    sa.execute_step()
+
+
+def _read_query_deviations():
+    """Best-effort read of the query's deviation outputs.
+
+    SA reports the deviation of the RESULTING points from the target object
+    (0 for "Points on Object"; the back-away distance for the offset outputs).
+    """
+    outs = {}
+    for key, labels in (
+        ("rms_deviation", ("RMS Deviation",)),
+        ("max_abs_deviation", ("Max Absolute Deviation",)),
+        ("average_deviation", ("Average Deviation",)),
+        ("standard_deviation", ("Standard Deviation",)),
+    ):
+        for lab in labels:
+            try:
+                outs[key] = float(sa.get_double_arg(lab))
+                break
+            except Exception:  # noqa: BLE001 - optional output
+                continue
+    return outs
+
+
+@mcp.tool()
+def sa_project_points(
+    objects: list[str],
+    point_groups: list[str] | None = None,
+    points: list[str] | None = None,
+    group: str = "",
+    result_group: str = "",
+    collection: str = "",
+    projection_type: str = "Points on Object",
+    ignore_edge_projections: bool = False,
+    use_stored_offsets: bool = False,
+    probe_offset_mm: float = 0.0,
+    extra_material_mm: float = 0.0,
+    rms_tolerance: float = 0.0,
+    max_abs_tolerance: float = 0.0,
+) -> dict:
+    """Project points onto object(s) at their closest point (new point group).
+
+    Mirrors SA's Construct > Points > Project Points to > Objects > Closest
+    Point: every source point (whole point groups and/or individual points) is
+    projected onto the nearest point of the target object(s) and written to a
+    NEW point group. Under the hood SA 2015 runs the 'Query Points to Objects'
+    step with Projection Options output "Points on Object" - the query
+    engine's "creates projected points on the object" mode - with 'Show
+    Results Dialog?' False.
+
+    Live-verified geometry on SA 2015: projected points land exactly ON the
+    object (plane z=25 -> z~0; cylinder r=430 -> r=r_fit to 1e-9). The step
+    status is NOT a reliable success signal: SA 2015 can return
+    DoneFatalError (code 3) while still creating the points (flaky, seen with
+    identical inputs across sessions), and it silently SKIPS points it cannot
+    project. projected/result_count are therefore decided by what the result
+    group actually contains, with status_code/status kept for reference.
+
+    Args:
+        objects: Target objects to project onto (plane, cylinder, sphere,
+                 circle, ...). Names may be full "C::O" or simple (resolved
+                 inside `collection`). With several objects every point lands
+                 on the nearest object among them.
+        point_groups: Point groups whose points are all projected
+                      (full "C::G" or simple name in `collection`).
+        points: Individual points to project, as full "C::G::T" or
+                group-relative "G::T" names (bare targets resolve against
+                `group`). At least one of point_groups/points is required.
+        group: Point group hint for bare target names in `points`.
+        result_group: Name of the NEW point group holding the projected points
+                      (GUI Point Naming dialog). A pre-existing group with
+                      this name is deleted first and reported under
+                      `replaced` (SA never overwrites - it would merge).
+                      Default: "<group>_proj" when a single group was given.
+        collection: Collection for simple object/group names and the result
+                    group ("" = current collection).
+        projection_type: Query projection output. Default "Points on Object"
+                         = projected closest points ON the object. Other SA
+                         values: "Points on Offset Object" (points backed off
+                         the surface by probe_offset_mm along the surface
+                         normal - the GUI Probe Offset semantics),
+                         "Points on Probe Surface", and the vector outputs
+                         "Offset Object To Target Vectors",
+                         "Target To Offset Object Vectors",
+                         "Object To Probe Vectors", "Probe To Object Vectors".
+        ignore_edge_projections: Drop points whose projection would land on an
+                                 object edge (surface boundary).
+        use_stored_offsets: True = let SA apply each source point's stored
+                            probe/reflector offset (measured-surface
+                            semantics). Default False = project the raw
+                            coordinates with the stored offsets ignored
+                            (deterministic; avoids SA 2015 fatals on groups
+                            that carry stored offsets). Either way the created
+                            points land on the object.
+        probe_offset_mm: Back-away distance from the surface (GUI Probe Offset
+                         dialog; positive = along the outward surface normal).
+                         Note: with projection_type "Points on Object" SA 2015
+                         ignores this value (verified - points always land ON
+                         the object); use "Points on Offset Object" to create
+                         backed-off points.
+        extra_material_mm: Virtual material thickness added to the target
+                           objects before projecting. Observed no effect with
+                           "Points on Object" on SA 2015 (it matters for the
+                           offset/vector outputs).
+        rms_tolerance, max_abs_tolerance: Query tolerances (0.0 = none).
+
+    Returns:
+        {projected, step, status_code, status, messages, outputs,
+         projection_type, source, result_group, result_count, requested,
+         skipped, skipped_points, replaced, error?}
+    """
+    res = {
+        "projected": False,
+        "step": _PROJECT_QUERY_STEP,
+        "status": None,
+        "status_code": None,
+        "messages": [],
+        "outputs": {},
+        "projection_type": projection_type,
+        "source": {"point_groups": list(point_groups or []),
+                   "points": list(points or []), "count": 0},
+        "result_group": result_group,
+        "result_count": None,
+        "requested": 0,
+        "skipped": None,
+        "skipped_points": [],
+        "replaced": None,
+        "error": None,
+    }
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+    if projection_type not in _PROJECTION_OUTPUT_TYPES:
+        res["error"] = (f"Unknown projection_type {projection_type!r}. Valid "
+                        f"values: {', '.join(_PROJECTION_OUTPUT_TYPES)}.")
+        return res
+    try:
+        src = _projection_sources(point_groups, points, group, collection)
+        if src["error"]:
+            res["error"] = src["error"]
+            return res
+        res["source"]["count"] = len(src["names"])
+        res["source"]["from_groups"] = src["from_groups"]
+        res["requested"] = len(src["names"])
+        if not result_group:
+            if len(src["from_groups"]) == 1 and not (points or []):
+                result_group = src["from_groups"][0].split("::")[-1] + "_proj"
+                res["result_group"] = result_group
+            else:
+                res["error"] = ("result_group is required when projecting "
+                                "explicit points or several groups.")
+                return res
+        object_full = [_object_full_name(o, collection) for o in objects]
+        if not object_full:
+            res["error"] = "Give at least one target object."
+            return res
+        # Delete a same-named result group first: SA never overwrites a
+        # constructed object name, it merges/appends instead.
+        result_full = "::".join([collection or "", result_group])
+        try:  # existence check is best-effort (mirrors sa_fit_fixed)
+            prev = _objects_in_collection_by_type(collection, "Point Group")
+            suffix = f"::{result_group}"
+            if any(n == result_group or str(n).endswith(suffix)
+                   for n in prev):
+                _delete_geometry_objects(collection, [result_group])
+                res["replaced"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        _query_points_to_objects(
+            src["names"], object_full, collection, result_group,
+            projection_type, ignore_edge_projections, use_stored_offsets,
+            probe_offset_mm, extra_material_mm, rms_tolerance,
+            max_abs_tolerance)
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] = _safe_messages()
+        res["outputs"] = _read_query_deviations()
+        made = _points_in_group(result_full)
+        res["result_count"] = len(made)
+        if res["result_count"]:
+            res["projected"] = True
+            if res["result_count"] < res["requested"]:
+                want = {n.split("::")[-1] for n in src["names"]}
+                got = {n.split("::")[-1] for n in made}
+                res["skipped"] = res["requested"] - res["result_count"]
+                res["skipped_points"] = sorted(want - got)
+                res["minor_error"] = (
+                    f"{res['skipped']} of {res['requested']} point(s) were "
+                    "not projected (SA skips points it cannot project). "
+                    f"Skipped: {res['skipped_points'] or 'unknown'}.")
+            if code == 4:
+                res["minor_error"] = (
+                    "PARTIAL SUCCESS: some points/objects were not found or a "
+                    "tolerance was violated (points were still created).")
+            elif code not in (2, 4):
+                # SA 2015 flakily reports DoneFatalError while creating the
+                # points - the created group is the source of truth.
+                res["minor_error"] = (
+                    f"SA reported {res['status']} (code {code}) but created "
+                    f"{res['result_count']} projected point(s); treat the "
+                    "status as advisory.")
+        else:
+            res["error"] = (f"'{_PROJECT_QUERY_STEP}' returned {res['status']}"
+                            f" (code {code}) and no points were created.")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Vector groups: deviation arrows between points and objects
+# ("Сравнить > Точки > Объекты" / SA "Compare > Points > Objects").
+#
+# The GUI compare command is the same MP engine sa_project_points drives -
+# 'Query Points to Objects' - but its Projection Options output is one of the
+# VECTOR group types instead of "Points on Object": every source point is
+# compared (projected along the local normal) to the closest of the target
+# objects and a VECTOR GROUP is created, one deviation vector per point.
+# Per the SA User Manual (ch. 20 "Analysis" > Queries) the vectors are
+# whiskers "showing the deviation from the object to the point", and the
+# query automatically accounts for the per-point target/reflector offset:
+#   * "Object To Probe Vectors"  - arrows object -> measured point (the GUI's
+#     default "Offset Probe / inspect" perspective: how far is the measured
+#     point from nominal).
+#   * "Probe To Object Vectors"  - the same magnitudes, opposite direction
+#     ("build" perspective: how far to go to reach nominal).
+#   * "Target To Offset Object Vectors" / "Offset Object To Target Vectors" -
+#     the GUI "Offset Surface" pair: vectors with the head/tail at the
+#     measured point centre and ALL offsets applied at the object (used on
+#     thin parts so vectors do not hide behind the nominal surface).
+# Vector group display/colour parameters are read and changed by
+# sa_vector_group_props / sa_vector_group_style (below).
+#
+# MP Command Reference ch. 5/6 ("Vector Groups", "Get Vector Group
+# Properties", the colorization steps). Step/arg names below come from the
+# PDF, NOT yet confirmed live on SA 2015 (same flaky-query caveat as
+# sa_project_points applies: decide success by what the group contains).
+# ---------------------------------------------------------------------------
+
+# The four VECTOR-group outputs of the Query projection options (the other
+# three - "Points on Object" & friends - create point groups, see
+# sa_project_points). GUI default = the inspect whisker direction.
+_VECTOR_OUTPUT_TYPES = (
+    "Object To Probe Vectors",
+    "Probe To Object Vectors",
+    "Target To Offset Object Vectors",
+    "Offset Object To Target Vectors",
+)
+_VECTOR_DEFAULT_DIRECTION = "Object To Probe Vectors"
+
+_VG_COUNT_STEP = "Get Number of Vectors in Vector Group"
+_VG_PROP_STEP = "Get Vector Group Properties"
+_VG_ITH_STEP = "Get i-th Vector From Vector Group"
+_VG_NAME_ARG = "Vector Group Name"
+
+# 'Get Vector Group Properties' return args (MP Command Reference p. 360).
+_VG_PROP_INT = (
+    ("total_vectors", ("Total Vectors",)),
+    ("vectors_in_tolerance", ("Vectors In Tolerance",)),
+    ("vectors_out_of_tolerance", ("Vectors Out Of Tolerance",)),
+)
+_VG_PROP_DBL = (
+    ("pct_vectors_in_tolerance", ("% Vectors In Tolerance",)),
+    ("pct_vectors_out_of_tolerance", ("% Vectors Out Of Tolerance",)),
+    ("absolute_max_magnitude", ("Absolute Max Magnitude",)),
+    ("absolute_min_magnitude", ("Absolute Min Magnitude",)),
+    ("max_magnitude", ("Max Magnitude",)),
+    ("min_magnitude", ("Min Magnitude",)),
+    ("standard_deviation", ("Standard Deviation",)),
+    ("standard_deviation_mean_zero", ("Standard Deviation Mean Zero",)),
+    ("average_magnitude", ("Average Magnitude",)),
+    ("avg_abs_magnitude", ("Avg of Abs Magnitude",)),
+    ("high_tolerance_value", ("High Tolerance Value",)),
+    ("low_tolerance_value", ("Low Tolerance Value",)),
+)
+
+
+def _vector_group_count(collection, name):
+    """Number of vectors in a vector group, or None when not found."""
+    try:
+        sa.set_step(_VG_COUNT_STEP)
+        if not sa.set_collection_object_name_arg(_VG_NAME_ARG,
+                                                 collection, name):
+            return None
+        sa.execute_step()
+        if sa.get_step_result() != 2:
+            return None
+        return int(sa.get_integer_arg("Total Count"))
+    except Exception:  # noqa: BLE001 - group missing / engine hiccup
+        return None
+
+
+def _read_vector_group_props(collection, name):
+    """Statistics of one vector group ('Get Vector Group Properties')."""
+    res = {"ok": False, "properties": {}, "error": None}
+    try:
+        sa.set_step(_VG_PROP_STEP)
+        if not sa.set_collection_object_name_arg(_VG_NAME_ARG,
+                                                 collection, name):
+            res["error"] = f"Could not set '{_VG_NAME_ARG}'."
+            return res
+        sa.execute_step()
+        if sa.get_step_result() != 2:
+            res["error"] = (f"{_VG_PROP_STEP} failed - vector group "
+                            f"'{name}' not found?")
+            return res
+        for key, labels in _VG_PROP_INT:
+            for lab in labels:
+                try:
+                    res["properties"][key] = int(sa.get_integer_arg(lab))
+                    break
+                except Exception:  # noqa: BLE001 - wrong label, try next
+                    continue
+        for key, labels in _VG_PROP_DBL:
+            for lab in labels:
+                try:
+                    res["properties"][key] = float(sa.get_double_arg(lab))
+                    break
+                except Exception:  # noqa: BLE001 - wrong label, try next
+                    continue
+        res["ok"] = bool(res["properties"])
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+# 'Get i-th Vector From Vector Group' return arg labels (p. 391). The label
+# wording is taken from the MP table; several candidates are tried because
+# the PDF abbreviates the names (e.g. "... in working coordinates").
+_VG_VECTOR_LABELS = (
+    ("begin", ("Begin in Working", "Begin (in working coordinates)",
+               "Begin in Working Coordinates", "Begin Coordinate")),
+    ("end", ("End in Working", "End (in working coordinates)",
+             "End in Working Coordinates", "End Coordinate")),
+    ("delta", ("Total Delta in Working", "Total Delta",
+               "Delta (in working coordinates)", "Delta")),
+    ("ijk", ("ijk Unit Vector in Working", "ijk Unit Vector",
+             "Unit Vector (in working coordinates)", "Unit Vector", "ijk")),
+)
+
+
+def _read_vector_group_vectors(collection, name, max_vectors=200):
+    """Per-vector dump via 'Get i-th Vector From Vector Group' (0-based)."""
+    out = {"vectors": [], "read": 0, "error": None}
+    total = _vector_group_count(collection, name)
+    if total is None:
+        out["error"] = f"Vector group '{name}' not found."
+        return out
+    limit = min(total, max_vectors) if max_vectors else total
+    for i in range(limit):
+        try:
+            sa.set_step(_VG_ITH_STEP)
+            sa.set_collection_object_name_arg(_VG_NAME_ARG, collection, name)
+            sa.set_integer_arg("Vector Index", int(i))
+            sa.execute_step()
+            if sa.get_step_result() != 2:
+                continue
+            vec = {"index": i}
+            try:
+                vec["name"] = sa.get_string_arg("Vector Name")
+            except Exception:  # noqa: BLE001
+                pass
+            for key, labels in _VG_VECTOR_LABELS:
+                for lab in labels:
+                    try:
+                        vec[key] = [float(v) for v in sa.get_vector_arg(lab)]
+                        break
+                    except Exception:  # noqa: BLE001 - wrong label
+                        continue
+            try:
+                vec["magnitude"] = float(sa.get_double_arg("Magnitude"))
+            except Exception:  # noqa: BLE001
+                pass
+            out["vectors"].append(vec)
+        except Exception:  # noqa: BLE001 - one bad vector must not kill the loop
+            continue
+    out["read"] = len(out["vectors"])
+    out["total"] = total
+    if max_vectors and total > max_vectors:
+        out["truncated"] = total - max_vectors
+    return out
+
+
+@mcp.tool()
+def sa_compare_points_objects(
+    objects: list[str],
+    point_groups: list[str] | None = None,
+    points: list[str] | None = None,
+    group: str = "",
+    result_group: str = "",
+    collection: str = "",
+    projection_type: str = _VECTOR_DEFAULT_DIRECTION,
+    ignore_edge_projections: bool = False,
+    use_stored_offsets: bool = True,
+    probe_offset_mm: float = 0.0,
+    extra_material_mm: float = 0.0,
+    rms_tolerance: float = 0.0,
+    max_abs_tolerance: float = 0.0,
+) -> dict:
+    """Create a VECTOR GROUP of deviations: measured points vs objects.
+
+    Mirrors SA's GUI Compare > Points > Objects ("Сравнить > Точки >
+    Объекты"): each source point (whole point groups and/or individual
+    points) is compared to the closest of the target objects (primitives and
+    surfaces) and the deviations are written to a NEW vector group - one
+    whisker per point, the primary graphical way SA shows deviations. Under
+    the hood SA 2015 runs the same 'Query Points to Objects' step as
+    sa_project_points but with a Projection Options *vector* output.
+
+    Vectors automatically account for the per-point stored target/reflector
+    offset unless use_stored_offsets=False (SA User Manual ch. 20: "All
+    query commands automatically account for target offset unless otherwise
+    noted").
+
+    Args:
+        objects: Target objects to compare to (plane, cylinder, sphere,
+                 circle, surface, ...). Full "C::O" or simple name (resolved
+                 inside `collection`). Each point queries the nearest object.
+        point_groups: Point groups whose points are all compared (full
+                      "C::G" or simple name in `collection`).
+        points: Individual points to compare (full "C::G::T", group-relative
+                "G::T", or bare target against `group`). At least one of
+                point_groups/points is required.
+        group: Point group hint for bare target names in `points`.
+        result_group: Name of the NEW vector group with the deviation arrows.
+                      Default: "<group>_dev" for a single source group. A
+                      pre-existing vector group with this name is deleted
+                      first and reported under `replaced` (SA never
+                      overwrites - it would create a suffixed duplicate).
+        collection: Collection holding points, objects and the result ("" =
+                    current collection).
+        projection_type: Direction of the whiskers (the GUI Projection
+                         Options). Default "Object To Probe Vectors" = the
+                         GUI "Offset Probe / inspect" default: arrows from
+                         the object to the measured point (how far the point
+                         is from nominal). "Probe To Object Vectors" is the
+                         reversed "build" view (same magnitudes). The
+                         "Offset Surface" pair is "Target To Offset Object
+                         Vectors" / "Offset Object To Target Vectors"
+                         (vectors anchored at the point centre with all
+                         offsets applied on the object - for thin parts).
+        ignore_edge_projections: Drop points whose projection lands on an
+                                 object edge.
+        use_stored_offsets: True = let SA apply each point's stored
+                            probe/reflector offset (measured-surface
+                            semantics, like the GUI). False = compare the raw
+                            coordinates (deterministic; avoids SA 2015 fatals
+                            on groups that carry stored offsets - see
+                            sa_project_points).
+        probe_offset_mm: Extra constant offset applied at the probe when
+                         overriding/storing is off; 0.0 = none.
+        extra_material_mm: Virtual material thickness added to the objects
+                           before comparing (0.0 = none).
+        rms_tolerance, max_abs_tolerance: Query tolerances (0.0 = none).
+
+    Returns:
+        {created, vector_group, vector_count, properties, step, status_code,
+         status, messages, outputs, projection_type, source, result_group,
+         requested, skipped, replaced, error?}
+    """
+    res = {
+        "created": False,
+        "vector_group": None,
+        "vector_count": 0,
+        "properties": {},
+        "step": _PROJECT_QUERY_STEP,
+        "status": None,
+        "status_code": None,
+        "messages": [],
+        "outputs": {},
+        "projection_type": projection_type,
+        "source": {"point_groups": list(point_groups or []),
+                   "points": list(points or []), "count": 0},
+        "result_group": result_group,
+        "requested": 0,
+        "skipped": None,
+        "replaced": None,
+        "error": None,
+    }
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+    if projection_type not in _VECTOR_OUTPUT_TYPES:
+        res["error"] = (f"projection_type {projection_type!r} does not "
+                        f"create a vector group. Use one of: "
+                        f"{', '.join(_VECTOR_OUTPUT_TYPES)} (the point-group "
+                        "outputs belong to sa_project_points).")
+        return res
+    try:
+        src = _projection_sources(point_groups, points, group, collection)
+        if src["error"]:
+            res["error"] = src["error"]
+            return res
+        res["source"]["count"] = len(src["names"])
+        res["source"]["from_groups"] = src["from_groups"]
+        res["requested"] = len(src["names"])
+        if not result_group:
+            if len(src["from_groups"]) == 1 and not (points or []):
+                result_group = src["from_groups"][0].split("::")[-1] + "_dev"
+                res["result_group"] = result_group
+            else:
+                res["error"] = ("result_group is required when comparing "
+                                "explicit points or several groups.")
+                return res
+        object_full = [_object_full_name(o, collection) for o in objects]
+        if not object_full:
+            res["error"] = "Give at least one target object."
+            return res
+        # Delete a same-named vector group first: SA never overwrites a
+        # constructed object name (it auto-suffixes duplicates).
+        try:
+            prev = _objects_in_collection_by_type(collection, "Vector Group")
+            suffix = f"::{result_group}"
+            if any(n == result_group or str(n).endswith(suffix)
+                   for n in prev):
+                _delete_geometry_objects(collection, [result_group])
+                res["replaced"] = True
+        except Exception:  # noqa: BLE001
+            prev = []
+        _query_points_to_objects(
+            src["names"], object_full, collection, result_group,
+            projection_type, ignore_edge_projections, use_stored_offsets,
+            probe_offset_mm, extra_material_mm, rms_tolerance,
+            max_abs_tolerance)
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] = _safe_messages()
+        res["outputs"] = _read_query_deviations()
+        now = _objects_in_collection_by_type(collection, "Vector Group")
+        made = [n for n in now if n not in set(prev)] or now
+        # Prefer the requested name (delete may have raced the engine), else
+        # the first freshly created group.
+        wanted = f"{collection}::{result_group}" if collection \
+            else result_group
+        found = next((n for n in made if str(n) == wanted
+                      or str(n).endswith(f"::{result_group}")), None)
+        full_name = found or (made[0] if made else None)
+        res["vector_group"] = str(full_name) if full_name else None
+        if full_name:
+            coll, bare = _vg_name_parts(str(full_name))
+            count = _vector_group_count(coll, bare)
+            res["vector_count"] = count if count is not None else 0
+            if count is not None:
+                res["created"] = True
+                props = _read_vector_group_props(coll, bare)
+                if props.get("ok"):
+                    res["properties"] = props["properties"]
+            if res["requested"]:
+                res["skipped"] = max(0, res["requested"] - res["vector_count"])
+            if res["vector_count"] == 0:
+                res["minor_error"] = (
+                    "The query created an EMPTY vector group (SA could not "
+                    "project/compare any point).")
+            elif code not in (2, 4):
+                # Same flaky-Query caveat as sa_project_points: SA 2015 can
+                # report DoneFatalError while still creating the vectors.
+                res["minor_error"] = (
+                    f"SA reported {res['status']} (code {code}) but created "
+                    f"{res['vector_count']} vector(s); treat the status as "
+                    "advisory.")
+            elif code == 4 and res["skipped"]:
+                res["minor_error"] = (
+                    f"PARTIAL SUCCESS: {res['skipped']} of "
+                    f"{res['requested']} point(s) produced no vector.")
+        else:
+            res["error"] = (f"'{_PROJECT_QUERY_STEP}' returned "
+                            f"{res['status']} (code {code}) and no vector "
+                            "group was created.")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+def _vg_name_parts(full_name):
+    """Split a vector-group full name into (collection, object) parts."""
+    s = str(full_name)
+    if s.startswith("::"):
+        return "", s[2:]
+    if "::" in s:
+        return s.split("::", 1)
+    return "", s
+
+
+@mcp.tool()
+def sa_vector_group_props(vector_group: str, collection: str = "",
+                          include_vectors: bool = False,
+                          max_vectors: int = 200) -> dict:
+    """Statistics + optional per-vector data of one vector group.
+
+    Wraps 'Get Vector Group Properties' (counts, tolerances, magnitudes) and
+    - when include_vectors=True - dumps each vector via
+    'Get i-th Vector From Vector Group' (name, begin/end/delta/ijk in
+    working coordinates, magnitude). Everything a vector group "knows" that
+    you can read back:
+
+      total_vectors, vectors_in_tolerance, vectors_out_of_tolerance,
+      pct_vectors_in_tolerance, pct_vectors_out_of_tolerance,
+      absolute_max_magnitude, absolute_min_magnitude, max_magnitude,
+      min_magnitude, standard_deviation, standard_deviation_mean_zero,
+      average_magnitude, avg_abs_magnitude, high_tolerance_value,
+      low_tolerance_value.
+
+    The HIGH/LOW TOLERANCE here are the same values the colorization uses
+    (in/out-of-tolerance counts) - set them with sa_vector_group_style.
+    Graphical parameters (arrowheads, magnification, tubes/blotches, colour
+    bar, colour range...) live in the colorization options; they are NOT
+    readable through the SDK (SA exposes no getter for the options object)
+    but are written by sa_vector_group_style.
+
+    Args:
+        vector_group: Full "C::VG" or simple name (in `collection`).
+        collection: Collection holding the group ("" = current collection).
+        include_vectors: Also dump the individual vectors (one entry per
+                         vector: name, begin, end, delta, ijk, magnitude).
+        max_vectors: Cap on the per-vector dump (0 = no cap). The response
+                     reports `truncated` when the group is larger.
+
+    Returns:
+        {ok, vector_group, collection, properties, vector_count,
+         vectors (when include_vectors), truncated, error?}
+    """
+    res = {"ok": False, "vector_group": vector_group,
+           "collection": collection, "properties": {}, "vector_count": None,
+           "error": None}
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+    try:
+        full = _object_full_name(vector_group, collection)
+        coll, name = _vg_name_parts(full)
+        count = _vector_group_count(coll, name)
+        if count is None:
+            res["error"] = (f"Vector group '{full}' not found (run "
+                            "sa_inspect_project with object_types "
+                            "['Vector Group'] to list them).")
+            return res
+        res["vector_count"] = count
+        props = _read_vector_group_props(coll, name)
+        if props.get("ok"):
+            res["properties"] = props["properties"]
+        if include_vectors:
+            dump = _read_vector_group_vectors(coll, name, max_vectors)
+            res["vectors"] = dump.get("vectors", [])
+            if dump.get("truncated"):
+                res["truncated"] = dump["truncated"]
+            res["error"] = dump["error"] if not res["properties"] \
+                and dump.get("error") else res["error"]
+        res["ok"] = True
+        res["vector_group"] = str(full)
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+@mcp.tool()
+def sa_vector_group_style(
+    vector_groups: list[str],
+    collection: str = "",
+    auto_range: bool = False,
+    treat_individually: bool = False,
+    color_range_method: str = "Go/No-Go",
+    base_high_color: str = "Red",
+    base_mid_color: str = "Green",
+    base_low_color: str = "Blue",
+    draw_arrowheads: bool = True,
+    draw_tubes: bool = False,
+    indicate_values: bool = False,
+    vector_magnification: float = 1.0,
+    vector_width: int = 1,
+    draw_blotches: bool = False,
+    blotch_size: float = 0.0,
+    show_out_of_tolerance_only: bool = False,
+    show_color_bar_in_view: bool = False,
+    show_color_bar_percentages: bool = False,
+    show_color_bar_fractions: bool = False,
+    high_saturation_limit: float = 0.0,
+    low_saturation_limit: float = 0.0,
+    high_tolerance: float = 0.0,
+    low_tolerance: float = 0.0,
+) -> dict:
+    """Style one or more vector groups (arrows, colours, tolerances, bar).
+
+    Wraps the SA 2015 colorization steps (MP Command Reference p. 362-365) -
+    'Set Vector Group Colorization Options (Selected)' or, with
+    auto_range=True, 'Auto-Range and Set Vector Group Colorization
+    (Selected)' (saturation limits computed from the data instead of given).
+    Every display/colour parameter of the GUI "Vector Group Properties"
+    dialog is exposed:
+
+      Display:    draw_arrowheads, draw_tubes, draw_blotches (arrows vs
+                  tubes vs blotches), indicate_values (label each vector
+                  with its magnitude), vector_magnification (graphical
+                  scale of the whiskers), vector_width (px), blotch_size
+                  (job units), show_out_of_tolerance_only, color bar:
+                  show_color_bar_in_view / _percentages / _fractions.
+      Colour:     color_range_method ("Go/No-Go", "Reverse Go/No-Go",
+                  "Continuous", "Continuous (Entire Range)", "4 Color
+                  Go/No-Go", ... - the five presets of the GUI), base
+                  high/mid/low colours, high/low saturation limits
+                  (auto_range computes them from the group data),
+                  high_tolerance / low_tolerance (feed the in/out-of-tol
+                  statistics read by sa_vector_group_props).
+
+    The SDK sets the WHOLE options object at once - every field you omit
+    takes the default above (there is no getter to read current options, so
+    partial updates are not possible). With auto_range=True only the colour
+    mode matters; the saturation limits are taken from the data, and
+    treat_individually=True ranges each group on its own max/min instead of
+    the whole selection.
+
+    Args:
+        vector_groups: One or more vector groups to style (full "C::VG" or
+                       simple names in `collection`).
+        collection: Collection the simple names live in ("" = current).
+        auto_range: Compute high/low saturation limits from the data instead
+                    of using the given *_saturation_limit values.
+        treat_individually: With auto_range, range each group separately
+                            (False = one shared range for the selection).
+        color_range_method / base_*_color: Colour scheme strings. NOTE: the
+                    exact SA enum spellings are taken from the SA docs/GUI
+                    presets and have NOT been verified live yet - if a step
+                    rejects a spelling, pass another (the known preset list
+                    above) and check the `status` in the response.
+        high_tolerance / low_tolerance: Tolerance band (job units); the
+                    in/out-of-tolerance vector counts of sa_vector_group_props
+                    are computed against it. 0.0 = no tolerance.
+
+    Returns:
+        {applied, step, status_code, status, messages, vector_groups,
+         auto_range, options, error?}
+    """
+    res = {"applied": False, "step": None, "status": None,
+           "status_code": None, "messages": [], "error": None,
+           "vector_groups": [], "auto_range": bool(auto_range),
+           "options": {}}
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+    if not vector_groups:
+        res["error"] = "Give at least one vector group."
+        return res
+    try:
+        full = [_object_full_name(v, collection) for v in vector_groups]
+        res["vector_groups"] = full
+        opts = {
+            "color_range_method": str(color_range_method),
+            "base_high_color": str(base_high_color),
+            "base_mid_color": str(base_mid_color),
+            "base_low_color": str(base_low_color),
+            "draw_arrowheads": bool(draw_arrowheads),
+            "draw_tubes": bool(draw_tubes),
+            "indicate_values": bool(indicate_values),
+            "vector_magnification": float(vector_magnification),
+            "vector_width": int(vector_width),
+            "draw_blotches": bool(draw_blotches),
+            "blotch_size": float(blotch_size),
+            "show_out_of_tolerance_only": bool(show_out_of_tolerance_only),
+            "show_color_bar_in_view": bool(show_color_bar_in_view),
+            "show_color_bar_percentages": bool(show_color_bar_percentages),
+            "show_color_bar_fractions": bool(show_color_bar_fractions),
+            "high_saturation_limit": float(high_saturation_limit),
+            "low_saturation_limit": float(low_saturation_limit),
+            "high_tolerance": float(high_tolerance),
+            "low_tolerance": float(low_tolerance),
+        }
+        res["options"] = opts
+        if auto_range:
+            step = "Auto-Range and Set Vector Group Colorization (Selected)"
+            res["step"] = step
+            sa.set_step(step)
+            sa.set_collection_vector_group_name_ref_list_arg(
+                "Vector Groups to be Set", full)
+            sa.set_bool_arg("Treat Individually?", bool(treat_individually))
+            sa.set_colorization_options_arg(
+                "Colorization Options (Uses Mode Only)", **opts)
+        else:
+            step = "Set Vector Group Colorization Options (Selected)"
+            res["step"] = step
+            sa.set_step(step)
+            sa.set_collection_vector_group_name_ref_list_arg(
+                "Vector Groups to be Set", full)
+            sa.set_colorization_options_arg("Colorization Options", **opts)
+        sa.execute_step()
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] = _safe_messages()
+        # code 4 = PARTIAL SUCCESS: at least one group was not found.
+        res["applied"] = code in (2, 4)
+        if not res["applied"]:
+            res["error"] = (f"{step} returned {res['status']} (code {code}). "
+                            "If a colour/range string was rejected, retry "
+                            "with another preset (see the docstring).")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Best fit over an explicit point list (across groups/collections) + a
+# geometry-type identifier for a point cloud.
+#
+# The fit tools above (sa_best_fit, sa_best_fit_report, sa_fit_clean,
+# sa_fit_fixed) take a WHOLE point group (or raw coordinates). SA's own fit
+# step has a list variant - "Fit Geometry to Points" (in "Points to Fit", a
+# Point Name Ref List of joined "C::G::T" names) - that fits EXACTLY the
+# named points, wherever they live: several groups, several collections, even
+# a subset of one group. sa_best_fit_from_points is the public wrapper for
+# that (the exclusion passes of sa_fit_clean already used the same step
+# internally). Each point keeps its stored reflector offset during the fit.
+#
+# The identifier (sa_identify_geometry) is pure offline math over the cloud's
+# coordinates: it free-fits every candidate primitive with sa_fitmath (line,
+# plane, circle, sphere, cylinder, cone-with-free-angle) and ranks them by
+# their residual RMS / degrees-of-freedom-adjusted sigma. A cloud that is
+# confined near a plane (a ring, a flat patch) is preferentially matched to a
+# 2D primitive (circle/plane/line) because on such clouds the 3D fits
+# "cheat": a cylinder of zero axial length IS a circle, and a thin ring sits
+# near its osculating sphere - so RMS alone cannot tell them apart.
+# ---------------------------------------------------------------------------
+
+_LIST_FIT_MIN_POINTS = {"line": 2, "plane": 3, "circle": 3, "sphere": 4,
+                        "cylinder": 5, "cone": 6}
+# Free-parameter counts of the primitives (for the dof-adjusted sigma).
+_CANDIDATE_DOF = {"line": 4, "plane": 3, "circle": 5, "sphere": 4,
+                  "cylinder": 5, "cone": 5}
+# Shape families for the confidence comparison: circle/cylinder/cone all fit
+# a cloud by radial distance to an axis (the circle fit IS a cylinder fit),
+# and on a flat cloud every curved primitive can degenerate into a plane.
+_SHAPE_FAMILY = {"line": "line", "plane": "plane", "sphere": "sphere",
+                 "circle": "axisymmetric", "cylinder": "axisymmetric",
+                 "cone": "axisymmetric"}
+
+
+def _ring_like(pts_raw, circle_c):
+    """True when the cloud's points all sit at ~one radius in the circle plane.
+
+    A ring/rim (points on a circular hole or stud, or any arc of it) has a
+    small radial spread about its mean radius; a filled patch or a line
+    crossing the plane does not. Uses the fitted circle candidate's
+    parameters, so the plane normal comes from the actual circle fit.
+    """
+    params = circle_c.get("parameters") or {}
+    nvec, center = params.get("normal"), params.get("center")
+    u = _unit(nvec or [0, 0, 0]) if nvec else None
+    if not center or u is None:
+        return False
+    radii = []
+    for pt in pts_raw:
+        w = _v3(pt, center)
+        s = _dot(w, u)
+        radii.append(_norm(_v3(w, [s * u[0], s * u[1], s * u[2]])))
+    mean_r = sum(radii) / len(radii)
+    if mean_r <= 1e-9:
+        return False
+    std_r = math.sqrt(sum((r - mean_r) ** 2 for r in radii) / len(radii))
+    return std_r / mean_r < 0.45
+
+
+def _point_ref_parts(full):
+    """Split a joined "C::G::T" point name into (collection, group, target).
+
+    A leading empty segment ("::G::T") means the group lives in the current
+    collection (the ref-list form SA emits for a bare group name).
+    """
+    parts = str(full).split("::")
+    if str(full).startswith("::"):
+        return "", parts[1], parts[-1]
+    return parts[0], parts[-2], parts[-1]
+
+
+def _read_selected_point_records(full_names):
+    """Read coordinates + stored offsets of exactly the given points.
+
+    Unlike _read_group_points (which reads a WHOLE group), this reads only the
+    selected points, one 'Get Point Coordinate' per point, so a 5-point pick
+    out of a 376-point group stays fast. Returns (records, unresolved) where
+    each record is {name, full, x, y, z, planar_offset, radial_offset} and
+    unresolved lists the full names whose coordinates could not be read.
+    """
+    records = []
+    unresolved = []
+    for full in full_names:
+        try:
+            coll, group, target = _point_ref_parts(full)
+            sa.set_step("Get Point Coordinate")
+            sa.set_point_name_arg("Point Name", coll, group, target)
+            if not sa.execute_step() or sa.get_step_result() != 2:
+                unresolved.append(str(full))
+                continue
+            rec = {
+                "name": f"{group}::{target}",
+                "full": str(full),
+                "x": float(sa.get_double_arg("X Value")),
+                "y": float(sa.get_double_arg("Y Value")),
+                "z": float(sa.get_double_arg("Z Value")),
+                "planar_offset": 0.0,
+                "radial_offset": 0.0,
+            }
+            try:  # stored probe/reflector offsets (may be absent: keep 0)
+                sa.set_step("Get Point Properties")
+                sa.set_point_name_arg("Point Name", coll, group, target)
+                if sa.execute_step() and sa.get_step_result() == 2:
+                    rec["planar_offset"] = float(
+                        sa.get_double_arg("Planar Offset"))
+                    rec["radial_offset"] = float(
+                        sa.get_double_arg("Radial Offset"))
+            except Exception:  # noqa: BLE001 - offsets are optional
+                pass
+            records.append(rec)
+        except Exception:  # noqa: BLE001 - one bad point must not kill the run
+            unresolved.append(str(full))
+    return records, unresolved
+
+
+def _fit_geometry_to_points(geometry_type, collection, object_name,
+                            full_names):
+    """Run 'Fit Geometry to Points' over a list of joined full point names.
+
+    SA's list variant of the fit step never pops dialogs and touches no point
+    group; it still applies each point's stored reflector offset (all
+    confirmed live on SA 2015, and already used by sa_fit_clean's passes).
+    Returns {constructed, status_code, status, messages, cardinal_removed,
+    minor_error?, error?}.
+    """
+    made = {"constructed": False, "step": "Fit Geometry to Points",
+            "status_code": None, "status": None, "messages": [],
+            "cardinal_removed": [], "error": None}
+    try:
+        sa.set_step("Fit Geometry to Points")
+        sa.set_geometry_type_arg("Geometry Type", BESTFIT_TYPES[geometry_type])
+        sa.set_point_name_ref_list_arg("Points to Fit", full_names)
+        sa.set_collection_object_name_arg("Resulting Object Name",
+                                          collection, object_name)
+        sa.set_string_arg("Fit Profile Name", "")
+        sa.set_bool_arg("Report Deviations", False)  # never pop the dialog
+        for arg in _TOLERANCE_ARG_NAMES:
+            if sa.set_double_arg(arg, 0.0):  # no tolerance limit
+                break
+        sa.set_bool_arg("Ignore Out of Tolerance Points", False)
+        sa.execute_step()
+        code = sa.get_step_result()
+        made["status_code"] = code
+        made["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        made["messages"] = _safe_messages()
+        if code in (2, 4):
+            made["constructed"] = True
+            if code == 4:
+                made["minor_error"] = (
+                    "PARTIAL SUCCESS: some named points were not found.")
+            made["cardinal_removed"] = _purge_auto_cardinal_groups(
+                collection, object_name)
+        else:
+            made["error"] = ("'Fit Geometry to Points' returned "
+                             f"{made['status']} (code {code}). The geometry "
+                             "was NOT created.")
+    except Exception as exc:  # noqa: BLE001
+        made["error"] = str(exc)
+    return made
+
+
+@mcp.tool()
+def sa_best_fit_from_points(
+    geometry_type: str,
+    object_name: str,
+    points: list[str],
+    group: str = "",
+    collection: str = "",
+    tolerance_mm: float | None = None,
+    probe_offset_mm: float | None = None,
+) -> dict:
+    """Construct a best-fit primitive from an EXPLICIT list of points.
+
+    The point source is individual points, not a whole group: 'Fit Geometry
+    to Points' fits exactly the named points wherever they live - a subset of
+    one point group, or points spread across several groups and collections.
+    Each entry may be a full "C::G::T" name, a group-relative "G::T" name
+    (resolved inside `collection`), or a bare target name (resolved against
+    `group`). Every point keeps its stored reflector offset during the fit.
+
+    geometry_type must be one of: plane, sphere, cylinder, cone, circle, line.
+    Minimum point counts: line 2, plane/circle 3, sphere 4, cylinder 5,
+    cone 6. Points whose coordinates cannot be read are dropped and listed
+    under `unresolved`.
+
+    SA never overwrites a constructed object name (it creates a suffixed
+    duplicate), so a pre-existing object named object_name is deleted first
+    and reported under `replaced_object`.
+
+    Args:
+        geometry_type: One of plane|sphere|cylinder|cone|circle|line.
+        object_name: Name for the constructed geometry object.
+        points: The points to fit (full/relative/bare names, any groups).
+        group: Point group hint for bare target names in `points`.
+        collection: Collection for simple names and the output object ("" if
+                    none / current collection).
+        tolerance_mm: Optional tolerance; points with |deviation| above it are
+                      listed as outliers ("вылеты").
+        probe_offset_mm: Constant reflector offset to compensate when the
+                         points store none.
+
+    Returns:
+        {constructed, geometry_type, object_name, step, status, parameters,
+         geometry, stats, outliers, compensation, point_source,
+         replaced_object, error?}
+    """
+    gtype = geometry_type.lower()
+    if gtype not in BESTFIT_TYPES:
+        return {"constructed": False, "error": (
+            f"Unknown geometry_type '{geometry_type}'. Choose one of: "
+            f"{sorted(BESTFIT_TYPES)}")}
+    if not object_name:
+        return {"constructed": False, "error": "Provide 'object_name'."}
+    if not points:
+        return {"constructed": False,
+                "error": "Provide 'points' (at least one point name)."}
+    if any("::" not in str(p) for p in points) and not group:
+        return {"constructed": False, "error": (
+            "Bare target names in 'points' need a 'group' to resolve against.")}
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+    full_names = [_point_full_name(p, group, collection) for p in points]
+    records, unresolved = _read_selected_point_records(full_names)
+    if not records:
+        return {"constructed": False, "point_group_count": len(points),
+                "unresolved": unresolved, "error": (
+                    "Could not read coordinates of any of the given points "
+                    "(are their group/collection names right?).")}
+    n = len(records)
+    min_pts = _LIST_FIT_MIN_POINTS[gtype]
+    if n < min_pts:
+        return {"constructed": False, "error": (
+            f"{gtype} fit needs >= {min_pts} points, got {n}.")}
+
+    # SA never overwrites: delete any pre-existing object of that name first.
+    replaced = False
+    try:
+        obj_type = BESTFIT_TYPES[gtype]
+        prev = _objects_in_collection_by_type(collection, obj_type)
+        suffix = f"::{object_name}"
+        replaced = any(n == object_name or str(n).endswith(suffix)
+                       for n in prev)
+    except Exception:  # noqa: BLE001 - existence check is best-effort
+        pass
+    _delete_geometry_objects(collection, [object_name])
+
+    made = _fit_geometry_to_points(gtype, collection, object_name,
+                                   [r["full"] for r in records])
+    base = {
+        "constructed": made["constructed"],
+        "geometry_type": geometry_type,
+        "object_name": object_name,
+        "step": made["step"],
+        "status_code": made["status_code"],
+        "status": made["status"],
+        "messages": made["messages"],
+        "replaced_object": replaced,
+        "point_source": {
+            "requested": len(points),
+            "point_count": n,
+            "unresolved": unresolved,
+            "groups": sorted({_point_ref_parts(r["full"])[1]
+                              for r in records}),
+        },
+    }
+    if made["cardinal_removed"]:
+        base["cardinal_points_removed"] = made["cardinal_removed"]
+    if not made["constructed"]:
+        base["error"] = made["error"]
+        return base
+    q = _quality_result(gtype, collection, object_name, "", records,
+                        tolerance_mm=tolerance_mm,
+                        probe_offset_mm=probe_offset_mm)
+    base.update(q)
+    base["geometry_type"] = geometry_type
+    return base
+
+
+# -- geometry-type identification over a point cloud -------------------------
+
+def _round_params(params):
+    """Round a sa_fitmath param dict (floats + [x,y,z] vectors) for output."""
+    out = {}
+    for k, v in (params or {}).items():
+        if isinstance(v, (list, tuple)) and len(v) == 3:
+            out[k] = [round(float(x), 9) for x in v]
+        elif isinstance(v, (int, float)):
+            out[k] = round(float(v), 9)
+        else:
+            out[k] = v
+    return out
+
+
+def _classify_cloud(pts_raw):
+    """Fit every candidate primitive to the cloud and rank the results.
+
+    Returns {ok, cloud, candidates (sorted), best, confidence, notes,
+    error?}. Each candidate carries rms (plain) and sigma_hat (RMS adjusted
+    for the primitive's free-parameter count). Fits that fail or diverge are
+    listed with ok: False so the caller sees what was tried.
+    """
+    n = len(pts_raw)
+    stats = sa_fitmath.cloud_stats(pts_raw)
+    if n >= 3 and max(stats.get("sizes") or [0.0]) <= 1e-12:
+        return {"ok": False, "cloud": stats, "candidates": [], "error": (
+            "All points (nearly) coincide - there is no extent to identify "
+            "a shape from.")}
+    candidates = []
+    for gtype in ("line", "plane", "circle", "sphere", "cylinder", "cone"):
+        entry = {"geometry_type": gtype, "ok": False, "rms": None,
+                 "sigma_hat": None, "parameters": {}, "error": None}
+        if n < _LIST_FIT_MIN_POINTS[gtype]:
+            entry["error"] = (f"needs >= {_LIST_FIT_MIN_POINTS[gtype]} "
+                              "points")
+            candidates.append(entry)
+            continue
+        try:
+            res = sa_fitmath.fit_geometry(gtype, pts_raw)
+            residuals = res.get("residuals") or []
+            if not res.get("ok") or len(residuals) != n \
+                    or not all(math.isfinite(v) for v in residuals):
+                entry["error"] = res.get("error") or "fit failed/diverged"
+                candidates.append(entry)
+                continue
+            sse = sum(v * v for v in residuals)
+            rms = math.sqrt(sse / n)
+            dof = max(1, n - _CANDIDATE_DOF[gtype])
+            entry["ok"] = True
+            entry["rms"] = round(rms, 9)
+            entry["sigma_hat"] = round(math.sqrt(sse / dof), 9)
+            entry["parameters"] = _round_params(res.get("params"))
+        except Exception as exc:  # noqa: BLE001
+            entry["error"] = str(exc)
+        candidates.append(entry)
+
+    valid = [c for c in candidates if c["ok"]]
+    valid.sort(key=lambda c: (c["sigma_hat"], _CANDIDATE_DOF[c["geometry_type"]],
+                              c["geometry_type"]))
+    if not valid:
+        return {"ok": False, "cloud": stats,
+                "candidates": candidates, "error": (
+                    "No primitive fit converged for this cloud - it may be "
+                    "too small, degenerate or a non-primitive free-form "
+                    "surface.")}
+
+    best = valid[0]
+    min_sigma = best["sigma_hat"]
+    near = [c for c in valid
+            if c["sigma_hat"] <= min_sigma * 1.35 + 1e-9]
+    notes = []
+
+    def _key(c):
+        return (c["sigma_hat"], _CANDIDATE_DOF[c["geometry_type"]],
+                c["geometry_type"])
+
+    def _better(c1, c2):
+        return _key(c1) < _key(c2)
+
+    chosen = None
+    # Collinear cloud -> a line is the meaningful fit (checked before the flat
+    # branch: an exactly collinear cloud is also "flat", since it lies in any
+    # plane). Any radial fit (circle/cylinder/sphere/cone) can absorb the tiny
+    # lateral scatter by collapsing to a ~noise-scale radius and looks
+    # "better" in raw RMS, and a plane just contains the line (infinitely
+    # many), so only a fit that is much better than the line's - a real thin
+    # tube/rod whose radius is large next to the scatter - may override it.
+    if stats.get("linear"):
+        line_c = next((c for c in valid
+                       if c["geometry_type"] == "line"), None)
+        radial = [c for c in valid
+                  if c["geometry_type"] in ("circle", "sphere", "cylinder",
+                                            "cone")]
+        if line_c:
+            rb = min(radial, key=_key) if radial else None
+            if rb is None or line_c["sigma_hat"] <= rb["sigma_hat"] * 3.0 \
+                    + 1e-9:
+                if best["geometry_type"] != "line":
+                    collapsed = (rb["parameters"] or {}).get("radius")
+                    if isinstance(collapsed, (int, float)):
+                        notes.append(
+                            "cloud is (nearly) collinear - the "
+                            f"{best['geometry_type']} only fits by collapsing "
+                            f"to a ~{round(float(collapsed), 6)} radius; the "
+                            "line is the meaningful fit.")
+                    else:
+                        notes.append(
+                            "cloud is (nearly) collinear - the "
+                            f"{best['geometry_type']} fits only by a "
+                            "degenerate collapsed shape; the line is the "
+                            "meaningful fit.")
+                chosen = line_c
+            elif best["geometry_type"] == "line":
+                chosen = line_c
+    # Flat cloud -> prefer the 2D primitive (circle/plane/line): the free
+    # circle fit is mathematically a cylinder fit (both minimise the radial
+    # distance to an axis), so on a ring/short-bore the 3D fits match only by
+    # degenerate curvature and RMS alone cannot tell "ring" from "bore".
+    if chosen is None and stats.get("flat"):
+        planar = [c for c in near
+                  if c["geometry_type"] in ("line", "plane", "circle")]
+        if planar:
+            cand = min(planar, key=_key)
+            circle_c = next((c for c in planar
+                             if c["geometry_type"] == "circle"), None)
+            if cand["geometry_type"] == "plane" and circle_c \
+                    and _ring_like(pts_raw, circle_c) \
+                    and (circle_c["sigma_hat"]
+                         <= cand["sigma_hat"] * 1.5 + 1e-9
+                         or circle_c["rms"] <= cand["rms"] * 1.5 + 1e-9):
+                # All points at ~one radius in the fitted plane: the measured
+                # feature is a ring/rim, not a flat patch - the plane fits
+                # only because the ring itself is (nearly) coplanar.
+                if circle_c is not best:
+                    notes.append(
+                        "points form a ring in the fitted plane (radial "
+                        f"spread << radius) - the feature is a circle (RMS "
+                        f"{circle_c['rms']}), not just a plane.")
+                chosen = circle_c
+            elif _better(cand, best) \
+                    or cand["sigma_hat"] <= min_sigma * 1.5 + 1e-9:
+                if cand is not best and cand["geometry_type"] != "plane":
+                    notes.append(
+                        "cloud is confined near a plane - a "
+                        f"{cand['geometry_type']} explains it with "
+                        f"RMS {cand['rms']} vs {best['rms']} for the "
+                        f"{best['geometry_type']} (which only fits by "
+                        "degenerate curvature); preferring the planar type.")
+                chosen = cand
+    # Volumetric cloud: a tied "circle" best is really the cylinder/bore (the
+    # free circle fit == cylinder axis/radius fit), so prefer the solid.
+    if chosen is None and not stats.get("flat") \
+            and best["geometry_type"] == "circle":
+        solids = [c for c in near if c["geometry_type"] != "circle"]
+        if solids:
+            alt = min(solids, key=_key)
+            if _better(alt, best) \
+                    or alt["sigma_hat"] <= best["sigma_hat"] * 1.35 + 1e-9:
+                notes.append(
+                    "cloud is not planar - the free circle fit is a "
+                    "degenerate cylinder (same axis/radius residuals); "
+                    f"reporting the {alt['geometry_type']} instead.")
+                chosen = alt
+    # Short bore (two parallel rings of ~equal radius): the rings lie exactly
+    # on a sphere too (two circular cross-sections), and with the axial extent
+    # small vs the radius the sphere's centre is far off-plane - the sphere
+    # "fit" is just the osculating sphere through the rims. Bores/shafts are
+    # measured as ring levels, so prefer the cylinder on the tie (a sphere
+    # sampled in only two near-parallel rings would be unusual).
+    if chosen is None and not stats.get("flat") \
+            and best["geometry_type"] == "sphere":
+        cyl_c = next((c for c in near
+                      if c["geometry_type"] == "cylinder"), None)
+        if cyl_c:
+            r_sph = (best["parameters"] or {}).get("radius")
+            lo = (stats.get("sizes") or [0.0, 0.0, 0.0])[0]
+            if isinstance(r_sph, (int, float)) and r_sph > 0.0 and lo > 0.0 \
+                    and r_sph >= 4.0 * lo \
+                    and cyl_c["sigma_hat"] <= best["sigma_hat"] * 1.35 + 1e-9:
+                notes.append(
+                    "the points sit on ~parallel rings at a small axial "
+                    "spread vs the radius - a sphere of radius "
+                    f"{r_sph:.4g} through the rims fits equally well; "
+                    "reporting the cylinder (bore/shaft) - check whether the "
+                    "surface between the rings bulges.")
+                chosen = cyl_c
+    if chosen is None:
+        chosen = best
+
+    # Confidence: separation from the best fit of a QUALITATIVELY different
+    # shape family. circle/cylinder/cone are one axisymmetric family (the
+    # circle free fit == cylinder fit; a cone with ~0 deg angle == cylinder),
+    # and on a flat cloud a sphere/cone/cylinder of huge radius degenerates
+    # into a plane - so rivals are compared across families only.
+    if chosen["geometry_type"] == "line":
+        # On a (near-)collinear cloud every curved fit collapses onto the line
+        # and a plane just contains it, so only a fit that is clearly worse
+        # than the line's (a real thick rod/tube) is a meaningful rival.
+        pool = [c for c in valid if c is not chosen
+                and c["geometry_type"] in ("circle", "sphere", "cylinder",
+                                           "cone")
+                and c["sigma_hat"] > chosen["sigma_hat"] * 3.0]
+    else:
+        chosen_fam = _SHAPE_FAMILY[chosen["geometry_type"]]
+        pool = [c for c in valid if c is not chosen
+                and _SHAPE_FAMILY[c["geometry_type"]] != chosen_fam]
+    if stats.get("flat") and chosen["geometry_type"] in ("plane", "circle"):
+        # On a flat cloud a sphere/cylinder/cone only matches by osculating
+        # with huge curvature radius (degenerate) - not a real rival.
+        pool = [c for c in pool
+                if c["geometry_type"] not in ("sphere", "cylinder", "cone")]
+        if chosen["geometry_type"] == "circle":
+            # The ring was chosen on its radial pattern; the plane through it
+            # just contains the ring and is no rival either.
+            pool = [c for c in pool if c["geometry_type"] != "plane"]
+    if not pool:
+        # No qualitatively different shape competes (e.g. on a collinear cloud
+        # every curved fit collapses onto the line) - the pick is decisive.
+        confidence = "high"
+    else:
+        second = min(pool, key=_key)
+        if chosen["sigma_hat"] <= 0.0:
+            confidence = ("high" if second["sigma_hat"] > 1e-9 else "low")
+        else:
+            ratio = second["sigma_hat"] / chosen["sigma_hat"]
+            confidence = ("high" if ratio >= 4.0
+                          else "medium" if ratio >= 1.8 else "low")
+
+    # Supplementary ambiguity notes.
+    if chosen["geometry_type"] == "cylinder":
+        cone_c = next((c for c in near
+                       if c["geometry_type"] == "cone"), None)
+        if cone_c:
+            incl = (cone_c["parameters"] or {}).get("included_angle")
+            if incl is not None and incl < 2.0:
+                notes.append(f"the cone candidate has included_angle "
+                             f"{incl:.3f} deg - effectively a cylinder "
+                             "(taper below the fit noise).")
+            else:
+                notes.append(f"a cone also fits with RMS {cone_c['rms']} - "
+                             "check whether the surface tapers.")
+    elif chosen["geometry_type"] == "cone":
+        cyl_c = next((c for c in near
+                      if c["geometry_type"] == "cylinder"), None)
+        if cyl_c:
+            notes.append(f"a cylinder also fits with RMS {cyl_c['rms']} "
+                         f"(vs {chosen['rms']}) - the taper is "
+                         f"{chosen['parameters'].get('included_angle', 0):.2f}"
+                         " deg; compare the form.")
+    if chosen["geometry_type"] == "circle":
+        plane_c = next((c for c in valid
+                        if c["geometry_type"] == "plane"), None)
+        if plane_c and plane_c["sigma_hat"] \
+                <= chosen["sigma_hat"] * 1.5 + 1e-9:
+            notes.append("all points are also (nearly) coplanar - a plane "
+                         "explains them equally; 'circle' assumes the points "
+                         "sit on a ring/rim (a circular hole or stud), not "
+                         "spread across the plane.")
+    # A best fit whose residual is large relative to the cloud size means the
+    # points probably do not lie on any single primitive (free-form surface or
+    # a mix of shapes). `recognized` mirrors that: False = nothing fits well
+    # enough to call the cloud a primitive.
+    hi_eig = max(stats.get("eigenvalues") or [0.0])
+    cloud_size = math.sqrt(hi_eig / n) if hi_eig > 0.0 and n else 0.0
+    recognized = chosen["sigma_hat"] <= 0.05 * cloud_size + 1e-9
+    if not recognized:
+        notes.append("the winning fit's residual is large relative to the "
+                     "cloud size - the points probably do not lie on any "
+                     "single primitive (free-form surface or a mix of "
+                     "shapes).")
+    for c in valid:  # mark the ranking order for the caller
+        c["rank"] = valid.index(c) + 1
+    ordered = sorted(valid, key=lambda c: c["rank"]) + \
+        [c for c in candidates if not c["ok"]]
+    return {"ok": True, "cloud": stats, "candidates": ordered,
+            "best": chosen, "confidence": confidence, "notes": notes,
+            "recognized": recognized,
+            "error": None}
+
+
+@mcp.tool()
+def sa_identify_geometry(
+    point_group: str = "",
+    collection: str = "",
+    coordinates: list | None = None,
+    points: list[str] | None = None,
+    group: str = "",
+) -> dict:
+    """Identify the geometric shape a point cloud was measured from.
+
+    Fits every candidate primitive to the cloud by least squares (offline,
+    sa_fitmath) and ranks them by residual: line, plane, circle, sphere,
+    cylinder and cone (free included angle). The result is a ranking plus a
+    `best` pick - not a single verdict, because some shapes are genuinely
+    ambiguous on partial data: a short axial segment fits both a circle and a
+    cylinder, a flat cap both a plane and a huge sphere, a small cone angle
+    reads as a cylinder. RMS alone cannot separate those, so the cloud's
+    gross shape (confined to a plane? collinear? volumetric) breaks the ties:
+    flat clouds prefer the 2D primitive, collinear clouds a line, volumetric
+    clouds a solid (a free circle fit on a non-planar cloud is a degenerate
+    cylinder). Each candidate reports its RMS and degrees-of-freedom adjusted
+    sigma_hat; `confidence` says how separated the best fit is from the
+    runner-up. No geometry is created in SA.
+
+    Point source (one of):
+      - point_group: name of an existing point group (in `collection`), or
+      - points: individual points (same name forms as sa_best_fit_from_points
+        - any groups/collections), or
+      - coordinates: list of [x, y, z] triples (fully offline, no SA needed).
+    At least one is required. Reflector offsets do not change the verdict (a
+    constant offset only shifts the fitted radius/plane, which a free fit
+    absorbs), so the reported parameters describe the measured
+    reflector-centre surface.
+
+    Returns:
+        {ok, best_geometry, best_parameters, confidence, candidates (sorted
+         by quality), cloud, notes, point_source, error?}
+    """
+    if point_group and (coordinates is not None or points):
+        return {"ok": False, "error": (
+            "Give one point source only: point_group, points or coordinates.")}
+    source = None
+    if coordinates is not None:
+        records = [{"name": f"P{i + 1}", "x": float(xyz[0]),
+                    "y": float(xyz[1]), "z": float(xyz[2]),
+                    "planar_offset": 0.0, "radial_offset": 0.0}
+                   for i, xyz in enumerate(coordinates)]
+        source = {"type": "coordinates", "count": len(records)}
+    elif points:
+        if any("::" not in str(p) for p in points) and not group:
+            return {"ok": False, "error": (
+                "Bare target names in 'points' need a 'group' to resolve "
+                "against.")}
+        try:
+            _ensure_sa()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        full_names = [_point_full_name(p, group, collection) for p in points]
+        records, unresolved = _read_selected_point_records(full_names)
+        source = {"type": "points", "requested": len(points),
+                  "unresolved": unresolved}
+        if not records:
+            return {"ok": False, "error": (
+                "Could not read coordinates of any of the given points."),
+                "point_source": source}
+    elif point_group:
+        try:
+            _ensure_sa()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        rd = _read_group_points(collection, point_group)
+        if not rd["ok"]:
+            return {"ok": False, "error": rd["error"]}
+        records = rd["points"]
+        source = {"type": "point_group", "group": point_group,
+                  "count": rd["count"]}
+    else:
+        return {"ok": False, "error": (
+            "Give a point source: point_group, points or coordinates.")}
+    if len(records) < 3:
+        return {"ok": False, "point_source": source, "error": (
+            "Need >= 3 points to identify a shape (2 points are always just "
+            f"a line); got {len(records)}.")}
+    pts_raw = [[r["x"], r["y"], r["z"]] for r in records]
+    cls = _classify_cloud(pts_raw)
+    if not cls.get("ok"):
+        return {"ok": False, "point_source": source, "error": cls["error"],
+                "candidates": cls.get("candidates")}
+    cloud = {"point_count": len(records), "flat": cls["cloud"].get("flat"),
+             "linear": cls["cloud"].get("linear"),
+             "sizes": [round(s, 9) for s in cls["cloud"].get("sizes", [])],
+             "centroid": [round(x, 9) for x in
+                          cls["cloud"].get("centroid", [])]}
+    best = cls["best"]
+    return {
+        "ok": True,
+        "best_geometry": best["geometry_type"],
+        "best_parameters": best["parameters"],
+        "best_rms_mm": best["rms"],
+        "recognized": cls.get("recognized", True),
+        "confidence": cls["confidence"],
+        "cloud": cloud,
+        "candidates": cls["candidates"],
+        "also_possible": [
+            c["geometry_type"] for c in cls["candidates"]
+            if c["ok"] and c is not best
+            and c["sigma_hat"] <= best["sigma_hat"] * 1.35 + 1e-9
+        ],
+        "notes": cls["notes"],
+        "point_source": source,
+        "error": None,
+    }
 
 
 # ---------------------------------------------------------------------------

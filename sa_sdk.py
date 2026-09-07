@@ -531,6 +531,89 @@ class SABridge:
             name, geometry_type,
         ))
 
+    def set_projection_options_arg(self, name, projection_type,
+                                   ignore_edge_projections=False,
+                                   override_target_offsets=False,
+                                   override_value=0.0,
+                                   add_extra_material_thickness=False,
+                                   extra_material_thickness=0.0):
+        # SetProjectionOptionsArg(BSTR argName, BSTR projectionType, BOOL
+        # ignoreEdgeProjections, BOOL bOverrideTargetOffsets, double
+        # overrideTargetOffsetsValue, BOOL bAddExtraMaterialThickness, double
+        # extraMaterialThicknessValue) - from the C++ SDK wrapper header
+        # (CSpatialAnalyzerSDK.h). projection_type is one of the SA strings
+        # ("Points on Object", "Probe To Object Vectors", ...). All params
+        # are plain BSTR/double/BOOL - no byref [out] - so dynamic dispatch
+        # works here.
+        return bool(self._call(
+            "SetProjectionOptionsArg", name, str(projection_type),
+            bool(ignore_edge_projections), bool(override_target_offsets),
+            float(override_value), bool(add_extra_material_thickness),
+            float(extra_material_thickness),
+        ))
+
+    def set_colorization_options_arg(
+            self, name, color_range_method, base_high_color,
+            base_mid_color, base_low_color, draw_tubes=True,
+            draw_arrowheads=True, indicate_values=False,
+            vector_magnification=1.0, vector_width=1, draw_blotches=False,
+            blotch_size=0.0, show_out_of_tolerance_only=False,
+            show_color_bar_in_view=False, show_color_bar_percentages=False,
+            show_color_bar_fractions=False, high_saturation_limit=0.0,
+            low_saturation_limit=0.0, high_tolerance=0.0,
+            low_tolerance=0.0):
+        # SetColorizationOptionsArg(BSTR argName, BSTR colorRangeMethod,
+        # BSTR baseHighColor, BSTR baseMidColor, BSTR baseLowColor, BOOL
+        # drawTubes, BOOL drawArrowheads, BOOL indicateValues, double
+        # vectorMagnification, long vectorWidth, BOOL drawBlotches, double
+        # blotchSize, BOOL showOutOfToleranceOnly, BOOL showColorBarInView,
+        # BOOL showColorBarPercentages, BOOL showColorBarFractions, double
+        # highSaturationLimit, double lowSaturationLimit, double highTolerance,
+        # double lowTolerance) - from CSpatialAnalyzerSDK.h. The vector-group
+        # colorization steps take the WHOLE compound in one arg
+        # ("Colorization Options" / "Colorization Options (Uses Mode Only)"),
+        # never Color Range Method / Base Color Type as standalone enum args;
+        # still routed through IDispatch::Invoke with explicit descriptors
+        # (same no-type-library reason as set_object_type_arg - the compound
+        # embeds two enum-typed strings, Color Range Method and Base Color
+        # Type, and dynamic dispatch is known to mangle those).
+        return bool(self._invoke_method(
+            "SetColorizationOptionsArg",
+            (pythoncom.VT_BOOL, 0),
+            ((pythoncom.VT_BSTR, 0),)  # argName
+            + ((pythoncom.VT_BSTR, 0),) * 4  # mode + 3 base colors
+            + ((pythoncom.VT_BOOL, 0),) * 3  # tubes, arrowheads, values
+            + ((pythoncom.VT_R8, 0), (pythoncom.VT_I4, 0))
+            + ((pythoncom.VT_BOOL, 0), (pythoncom.VT_R8, 0))
+            + ((pythoncom.VT_BOOL, 0),) * 4
+            + ((pythoncom.VT_R8, 0),) * 4,
+            name, str(color_range_method), str(base_high_color),
+            str(base_mid_color), str(base_low_color), bool(draw_tubes),
+            bool(draw_arrowheads), bool(indicate_values),
+            float(vector_magnification), int(vector_width),
+            bool(draw_blotches), float(blotch_size),
+            bool(show_out_of_tolerance_only), bool(show_color_bar_in_view),
+            bool(show_color_bar_percentages), bool(show_color_bar_fractions),
+            float(high_saturation_limit), float(low_saturation_limit),
+            float(high_tolerance), float(low_tolerance),
+        ))
+
+    def set_collection_vector_group_name_ref_list_arg(self, name, items):
+        # items: one JOINED hierarchical full name per vector group
+        # ("A::т контур откл"), same one-name-per-element layout as the
+        # ref-list getters emit. Vector group ref lists use the same
+        # VARIANT*-SAFEARRAY mechanism as the object/point lists.
+        joined = []
+        for it in items:
+            if isinstance(it, (list, tuple)):
+                c, o = (list(it) + [""])[:2]
+                joined.append("::".join([c or "", o or ""]))
+            else:
+                joined.append(str(it))
+        return self._set_variant_list(
+            "SetCollectionVectorGroupNameRefListArg", name, joined
+        )
+
     # -- ref-list setters (SAFEARRAY in a VARIANT* param) -------------------
     def _set_variant_list(self, method, name, values):
         # Set<...>RefListArg(BSTR argName, VARIANT* list) -> BOOL. Dynamic

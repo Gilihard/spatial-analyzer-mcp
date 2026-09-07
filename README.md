@@ -158,6 +158,56 @@ the server is a per-launch process and never picks up edits while running.
 | `sa_dialog_watchdog` | Background auto-closer of SA modals: `start` / `stop` / `status`. |
 | `sa_run_step(...)` | **Generic**: run any SA step by name with typed args + read outputs. |
 | `sa_construct_point(group, name, x, y, z)` | Concrete example / pipeline test. |
+| `sa_project_points(...)` | **Project points onto object(s)** at their closest point into a new point group (SA's «Проецировать точки на объекты»). |
+| `sa_compare_points_objects(...)` | **Compare points to objects** ("Сравнить > Точки > Объекты"): create a vector group of deviation whiskers — one arrow per point showing how far it is from the closest object. |
+| `sa_vector_group_props(...)` | **Vector group statistics** (`Get Vector Group Properties`: counts, in/out-of-tolerance, magnitude stats) + optional per-vector dump (begin/end/delta/ijk/magnitude). |
+| `sa_vector_group_style(...)` | **Style vector groups** (arrows/colour bar/tolerance band), incl. auto-range of the saturation limits. |
+| `sa_best_fit(...)` + `sa_best_fit_<shape>` | Best-fit plane/sphere/cylinder/cone/circle/line to a point group or raw coordinates. |
+| `sa_best_fit_from_points(...)` | Best fit to an **explicit list of points** — a subset of one group or points across several groups/collections (step `Fit Geometry to Points`). |
+| `sa_identify_geometry(...)` | **Identify the shape** a point cloud was measured from: fits line/plane/circle/sphere/cylinder/cone offline and ranks them (`best_geometry`, `confidence`, `recognized`, `notes`). Works from raw `coordinates` with no SA running. |
+
+### Example: project a point group onto a plane
+
+```
+sa_project_points(
+  objects=["Плоскость"],              # target: any fitted geometry
+  point_groups=["Точки_сверху"],      # source: whole point group(s) and/or `points`
+  result_group="Точки_проекция",      # new point group (default "<source>_proj")
+  collection="A"
+)
+# -> {projected: True, result_count: N, result_group: "Точки_проекция",
+#     status_code: 2|3|4 (advisory), skipped: [...], replaced: ...}
+```
+Every source point lands exactly ON the object (live-verified: plane z=25 →
+z≈0). SA 2015 can report a fatal status while still creating the points and
+can silently skip unprojectable points, so `projected`/`result_count` come
+from what the new group actually contains; missing targets are listed under
+`skipped_points`. A pre-existing group with the result name is deleted first
+(`replaced: True`). `projection_type="Points on Offset Object"` +
+`probe_offset_mm` backs the points off the surface along its normal.
+
+### Example: deviation whiskers — compare points to an object
+
+```
+sa_compare_points_objects(
+  objects=["MCP_BF_плоскость"],        # targets: fitted geometry / surface
+  point_groups=["Точки_сверху"],        # sources: whole group(s) and/or `points`
+  result_group="Точки_сверху_dev",      # new VECTOR group (default "<source>_dev")
+  collection="A"
+)
+# -> {created: True, vector_count: N, vector_group: "A::Точки_сверху_dev",
+#     properties: {total_vectors, average_magnitude, ...},
+#     status_code: 2|3|4 (advisory), replaced: ...}
+```
+Each point produces one whisker whose magnitude is its deviation from the
+closest object (default direction `Object To Probe Vectors` = arrows from
+the object to the measured point; `Probe To Object Vectors` reverses them,
+same magnitudes). Stored per-point probe/reflector offsets are applied by
+default (`use_stored_offsets=True`) — for measured groups the whisker is the
+true surface deviation. Same flaky-status caveat as the projection: success
+is decided by the created group. Read the arrows back with
+`sa_vector_group_props(vector_group=..., include_vectors=True)` and style
+them (colours, tolerance band, colour bar) with `sa_vector_group_style`.
 
 ### Modal dialogs that hang MCP — auto-closed
 
@@ -181,6 +231,37 @@ the watchdog never touches COM and never kills anything; a wedged
 `SpatialAnalyzerSDK.exe` engine still needs `taskkill //F //IM
 SpatialAnalyzerSDK.exe` (see AGENTS.md). Offline regression (no SA needed):
 `python _t_dialogs.py`.
+
+### Example: identify the shape of a point cloud
+
+```
+# Coordinates only -> fully offline, no SA needed.
+sa_identify_geometry(
+  coordinates=[[x,y,z], ...]
+)
+# -> {ok: True, best_geometry: "cylinder", best_parameters: {...},
+#     best_rms_mm: 0.02, confidence: "high", recognized: True,
+#     candidates: [...ranked fits...], notes: [...]}
+```
+
+`candidates` ranks all six primitives by fit residual, `best` is the semantic
+pick (e.g. a coplanar ring → `circle`, not the plane that also fits it),
+`recognized: False` means nothing fits well — the cloud is probably not a
+single primitive. Same tool reads an existing `point_group` or individual
+`points` (SA must be connected then).
+
+### Example: best-fit to a subset of points from several groups
+
+```
+sa_best_fit_from_points(
+  geometry_type="cylinder",
+  object_name="Цилиндр_по_выборке",
+  points=["A::т контур::12", "A::т контур::45", "B::Другие::3"],  # any groups
+  collection="A"
+)
+# -> {constructed: True, geometry: {radius: ...}, stats: {rms: ...},
+#     point_source: {point_count: 3, groups: ["т контур", "Другие"]}}
+```
 
 ### Example: construct a sphere via the generic tool
 ```
