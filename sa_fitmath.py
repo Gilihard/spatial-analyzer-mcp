@@ -283,11 +283,14 @@ def fit_geometry(geometry_type, pts, radius=None, apex_angle_deg=None,
         if gtype == "circle":
             return _fit_circle(pts, radius, side, off)
         if gtype == "cone":
-            if not apex_angle_deg or float(apex_angle_deg) <= 0 \
-                    or float(apex_angle_deg) >= 180:
+            if apex_angle_deg is None:
+                return _fit_cone_free(pts)
+            if float(apex_angle_deg) <= 0 or float(apex_angle_deg) >= 180:
                 return {"ok": False,
                         "error": "cone requires 0 < apex_angle_deg < 180"}
             return _fit_cone(pts, float(apex_angle_deg), side, off)
+        if gtype == "line":
+            return _fit_line(pts)
         if gtype == "plane":
             return _fit_plane(pts, side, off)
         return {"ok": False,
@@ -593,3 +596,165 @@ def _plane_fun(pts, side, off):
         mean_v = acc / n
         return [vals[i] - mean_v for i in range(n)]
     return fun
+
+
+# --------------------------------------------------------------------------
+# line (free; total least squares along the principal axis)
+# --------------------------------------------------------------------------
+
+def _fit_line(pts):
+    """Fit the axis line through the cloud (analytic, no LM).
+
+    The best-fit line of a point set is the principal axis (largest
+    eigenvector of the covariance). Residuals are the unsigned perpendicular
+    distances to the axis - a line has no meaningful sign.
+    """
+    cent = _mean(pts)
+    cov = [[0.0] * 3 for _ in range(3)]
+    for pt in pts:
+        w = _sub(pt, cent)
+        for i in range(3):
+            for j in range(3):
+                cov[i][j] += w[i] * w[j]
+    evs = _eig_sym3(cov)
+    u = evs[2][1]  # largest spread -> axis direction
+    if _norm(u) == 0:
+        return {"ok": False, "error": "degenerate point set"}
+    ts = [_dot(_sub(pt, cent), u) for pt in pts]
+    t0, t1 = min(ts), max(ts)
+    begin = [cent[i] + t0 * u[i] for i in range(3)]
+    end = [cent[i] + t1 * u[i] for i in range(3)]
+    residuals = []
+    for pt in pts:
+        w = _sub(pt, cent)
+        s = _dot(w, u)
+        residuals.append(_norm([w[0] - s * u[0],
+                                w[1] - s * u[1],
+                                w[2] - s * u[2]]))
+    params = {"begin": begin, "end": end, "axis": u, "length": t1 - t0}
+    return {"ok": True, "params": params, "residuals": residuals,
+            "raw_residuals": list(residuals), "iterations": 0,
+            "sse": sum(v * v for v in residuals)}
+
+
+# --------------------------------------------------------------------------
+# cone with a FREE included angle ("угол раствора" fitted, not fixed)
+# --------------------------------------------------------------------------
+
+def _cone_free_fun(pts):
+    """Residuals of a cone whose half-angle alpha is a fitted parameter.
+
+    Same geometry as _cone_fun (g = cos(a)*rho - sin(a)*s along the surface
+    normal), mean-centred to eliminate the apex axial position; alpha lives in
+    p[6] and must stay inside (0, pi) for sin(a) > 0.
+    """
+
+    def fun(p):
+        alpha = p[6]
+        if not (1e-4 < alpha < math.pi - 1e-4):
+            return [1e9] * len(pts)
+        u = _unit(p[3:6])
+        a = p[:3]
+        n = len(pts)
+        cos_a, sin_a = math.cos(alpha), math.sin(alpha)
+        g = []
+        for pt in pts:
+            w = _sub(pt, a)
+            s = _dot(w, u)
+            rho = _norm([w[0] - s * u[0], w[1] - s * u[1], w[2] - s * u[2]])
+            g.append(cos_a * rho - sin_a * s)
+        mean_g = sum(g) / n
+        return [v - mean_g for v in g]
+    return fun
+
+
+def _fit_cone_free(pts):
+    """Fit a cone with a free included angle (half-angle alpha = p[6]).
+
+    Init from a free cylinder fit on the same cloud: cylinder axis == cone
+    axis, and the half-angle is the slope of the rho-vs-axial-coordinate
+    regression. Returns the same param keys as the fixed-angle _fit_cone
+    (apex / axis / length / included_angle).
+    """
+    n = len(pts)
+    cyl = _fit_cylinder(pts, None, 0, [0.0] * n)
+    if not cyl.get("ok"):
+        return cyl
+    u0 = cyl["params"]["axis"]
+    a0 = cyl["params"]["begin"]
+    ts = [_dot(_sub(pt, a0), u0) for pt in pts]
+    rho = [_radial_dist(pt, a0, u0) for pt in pts]
+    mean_t = sum(ts) / n
+    mean_r = sum(rho) / n
+    var_t = sum((t - mean_t) ** 2 for t in ts)
+    spread = max(_norm(_sub(pt, a0)) for pt in pts)
+    if var_t <= 0.0 or math.sqrt(var_t) < 1e-9 * max(spread, 1e-9):
+        return {"ok": False,
+                "error": "cone needs axial extent (points collapse to a ring)"}
+    slope = sum((ts[i] - mean_t) * (rho[i] - mean_r)
+                for i in range(n)) / var_t
+    if slope < 0.0:  # points open towards -u: flip the axis, slope -> +|slope|
+        u0 = [-x for x in u0]
+        ts = [_dot(_sub(pt, a0), u0) for pt in pts]
+        slope = abs(slope)
+    alpha0 = min(max(math.atan(slope), math.radians(0.5)),
+                 math.radians(89.0))
+    p, sse, it = _lm(_cone_free_fun(pts), a0 + u0 + [alpha0])
+    alpha = p[6]
+    if not (1e-4 < alpha < math.pi - 1e-4):
+        return {"ok": False, "error": "cone fit diverged (bad angle)"}
+    a = p[:3]
+    u = _unit(p[3:6])
+    cos_a, sin_a = math.cos(alpha), math.sin(alpha)
+    rho = [_radial_dist(pt, a, u) for pt in pts]
+    ss = [_dot(_sub(pt, a), u) for pt in pts]
+    # apex axial offset from the base point a (mean over points of where the
+    # cone surface g = cos*rho - sin*s crosses zero)
+    tau = sum(ss[i] - cos_a * rho[i] / sin_a for i in range(n)) / n
+    apex = [a[i] + tau * u[i] for i in range(3)]
+    ax_from_apex = [ss[i] - tau for i in range(n)]
+    length = max(ax_from_apex)
+    length = max(length + 1e-6, 1e-6)
+    e = _cone_free_fun(pts)(p)
+    params = {"apex": apex, "axis": u, "length": length,
+              "included_angle": math.degrees(2.0 * alpha)}
+    return {"ok": True, "params": params, "residuals": e,
+            "raw_residuals": [0.0] * n,
+            "iterations": it, "sse": sse}
+
+
+# --------------------------------------------------------------------------
+# cloud shape descriptor (for the geometry-type classifier)
+# --------------------------------------------------------------------------
+
+def cloud_stats(pts):
+    """Eigen-decomposition of the cloud's covariance, sorted ascending.
+
+    The eigenvalue ratios separate the gross shape families cheaply, before
+    any fit: a plane-like / ring-like cloud has the smallest eigenvalue ~ 0
+    (points confined near a plane), a line has two small eigenvalues, a
+    sphere/cylinder/cone spread in all three directions. Values are in the
+    job length unit.
+    """
+    n = len(pts)
+    if n == 0:
+        return {"ok": False, "error": "no points"}
+    cent = _mean(pts)
+    cov = [[0.0] * 3 for _ in range(3)]
+    for pt in pts:
+        w = _sub(pt, cent)
+        for i in range(3):
+            for j in range(3):
+                cov[i][j] += w[i] * w[j]
+    evs = [v for v, _vec in _eig_sym3(cov)]  # ascending
+    out = {"ok": True, "point_count": n, "centroid": cent,
+           "eigenvalues": evs,
+           "sizes": [math.sqrt(max(v, 0.0)) for v in evs]}
+    lo, mid, hi = (math.sqrt(max(v, 0.0)) for v in evs)
+    scale = max(hi, 1e-300)
+    out["linear"] = mid < 0.02 * scale
+    # "flat" = points hug a plane: thickness (smallest std) below ~5% of the
+    # in-plane width. A thin ring (axial length << radius, e.g. L < ~0.12 R)
+    # is flat; a real bore with length comparable to its radius is not.
+    out["flat"] = lo < 0.05 * mid if mid > 0.0 else lo < 0.05 * scale
+    return out
