@@ -135,6 +135,11 @@ class SABridge:
         self._ready = threading.Event()
         self.host = None
         self.connected = False
+        # Number of COM tasks currently executing on the worker thread. The
+        # dialog watchdog reads it to decide whether a just-popped modal can
+        # block an MP step (see is_busy()).
+        self._busy_lock = threading.Lock()
+        self._busy = 0
         self._worker = threading.Thread(
             target=self._run, name="sa-com-worker", daemon=True
         )
@@ -194,12 +199,16 @@ class SABridge:
                 task = self._q.get()
                 if task is None:
                     break
+                with self._busy_lock:
+                    self._busy += 1
                 try:
                     task.result = task.func(*task.args, **task.kwargs)
                 except Exception as exc:  # noqa: BLE001 - surface any COM error
                     task.error = exc
                 finally:
                     task.done.set()
+                    with self._busy_lock:
+                        self._busy -= 1
         finally:
             pythoncom.CoUninitialize()
 
@@ -238,6 +247,19 @@ class SABridge:
 
     def is_connected(self) -> bool:
         return self.connected
+
+    def is_busy(self) -> bool:
+        """True while a COM task is running on the worker thread.
+
+        The dialog watchdog uses this as its gate: only while a task is in
+        flight is the server actually waiting on SA, so any modal dialog that
+        pops then is a step-blocker and may be dismissed. When the bridge is
+        idle, SA is either doing nothing or being driven by a human (e.g. a
+        construction dialog, the save-on-exit prompt), and no window may be
+        closed - the watchdog skips those scans entirely.
+        """
+        with self._busy_lock:
+            return self._busy > 0
 
     # -- generic step -------------------------------------------------------
     def set_step(self, name: str):
