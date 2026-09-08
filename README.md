@@ -154,8 +154,10 @@ the server is a per-launch process and never picks up edits while running.
 |------|---------|
 | `sa_status` | Is the server alive + connected? Call first. |
 | `sa_connect(host)` | Connect to a running SA process (default `localhost`). |
+| `sa_ensure_file(path, ...)` | **Work on a job file, attaching to the already-open copy** (no reload when SA already has it loaded); otherwise opens it — saving the current job first — and force-restarts SA with the file if the open cannot succeed. |
+| `sa_current_file()` | Report which job file SA appears to have loaded (session tracker + SA window caption). COM-free. |
 | `sa_dismiss_dialogs` | Close SA modal dialogs that are blocking MCP steps, right now. |
-| `sa_dialog_watchdog` | Background auto-closer of SA modals: `start` / `stop` / `status`. |
+| `sa_dialog_watchdog` | Background auto-closer of SA modals: `start` / `stop` / `status`. Only acts while a COM call is in flight. |
 | `sa_run_step(...)` | **Generic**: run any SA step by name with typed args + read outputs. |
 | `sa_construct_point(group, name, x, y, z)` | Concrete example / pipeline test. |
 | `sa_project_points(...)` | **Project points onto object(s)** at their closest point into a new point group (SA's «Проецировать точки на объекты»). |
@@ -165,6 +167,7 @@ the server is a per-launch process and never picks up edits while running.
 | `sa_best_fit(...)` + `sa_best_fit_<shape>` | Best-fit plane/sphere/cylinder/cone/circle/line to a point group or raw coordinates. |
 | `sa_best_fit_from_points(...)` | Best fit to an **explicit list of points** — a subset of one group or points across several groups/collections (step `Fit Geometry to Points`). |
 | `sa_identify_geometry(...)` | **Identify the shape** a point cloud was measured from: fits line/plane/circle/sphere/cylinder/cone offline and ranks them (`best_geometry`, `confidence`, `recognized`, `notes`). Works from raw `coordinates` with no SA running. |
+| `sa_point_coordinates(...)` | **Read raw point coordinates** for offline analysis: a whole group or an explicit list of points (`points` may span groups/collections), each with its stored probe/reflector offsets. Read-only; returns points in order + `bounds` (min/max/centroid). |
 
 ### Example: project a point group onto a plane
 
@@ -220,17 +223,49 @@ until a human clicks the dialog away. Two things fix that:
   0.5 s and closes blocking dialogs (WM_CLOSE, then Cancel/single-OK button
   click for survivors — a plain MB_OK error box has no close button, only its
   OK ends it). A mid-step modal now self-heals in about half a second.
+  **Crucially, it only scans while a COM call is actually in flight** (the
+  server waiting on SA). When no MCP step is running, SA is idle or being
+  driven by hand, and no window is touched — construction dialogs, the
+  save-on-exit prompt, etc. are left alone, so auto-close cannot interfere
+  with manual work or make SA impossible to close.
 - **One-shot tool:** `sa_dismiss_dialogs` closes whatever is up right now —
   call it and retry the stuck step. It needs no COM, so it works even while a
-  step is stuck.
+  step is stuck. (Unconditional: it also closes a dialog a human is looking
+  at, so use it deliberately.)
 
-Control: `sa_dialog_watchdog stop` disarms it for the session (do this if you
-are operating SA's GUI by hand); `start` re-arms it. Poll interval and an
+Control: `sa_dialog_watchdog stop` disarms it for the session; `start` re-arms
+it. With the step gate above you normally do NOT need to stop it while working
+SA by hand — only if a COM step and manual work would overlap (e.g. you keep a
+construction dialog open while the bot runs a step). Poll interval and an
 optional title filter (`title_contains`) are parameters. Pure Win32 calls —
 the watchdog never touches COM and never kills anything; a wedged
 `SpatialAnalyzerSDK.exe` engine still needs `taskkill //F //IM
 SpatialAnalyzerSDK.exe` (see AGENTS.md). Offline regression (no SA needed):
 `python _t_dialogs.py`.
+
+### Open a job file without discarding the already-open copy
+
+SA holds one job at a time, and its `Open SA File` step always **discards** the
+loaded job and reloads from disk — re-opening a file that is already open
+silently throws away unsaved in-memory state (previous fits, manual GUI
+edits). `sa_ensure_file` is the file-first bootstrap to use before acting on a
+job: if the file is already the loaded job it just attaches the SDK bridge and
+does nothing else; otherwise it opens the file (saving the current job first
+when its own file is known) and force-restarts SA with the file only if the
+open cannot succeed.
+
+```
+sa_ensure_file(r"C:\jobs\6.01.25 — обработка.xit")
+# -> {attached: True, already_open: True, opened: False, restarted: False,
+#     evidence: {tracked_path: ..., window_title: "SpatialAnalyzer - ...",
+#                how: "tracked"|"window-title"}, error: None}
+```
+
+SA 2015's SDK cannot report which file the GUI has open, so detection uses the
+two signals that exist: what THIS server session loaded/launched, and the SA
+main-window caption (catches a job opened by hand or by an earlier MCP
+session). `sa_current_file()` shows that evidence so you can decide what to do
+before opening. Offline logic regression (no SA needed): `python _t_openlogic.py`.
 
 ### Example: identify the shape of a point cloud
 
@@ -273,6 +308,26 @@ sa_run_step(
 )
 ```
 The exact step/arg names come from SA's MP tree or the SDK examples folder.
+
+### Example: pull raw point coordinates for offline analysis
+```
+sa_point_coordinates(
+  point_group="т контур",              # whole group (or `points` + `group`/`collection`)
+  collection="A",
+  max_points=5                          # cap a huge group; omit for all
+)
+# -> {ok: True, count: 5, total_points: 376, truncated: True,
+#     offsets_read: True,
+#     bounds: {min: [x,y,z], max: [x,y,z], centroid: [x,y,z]},
+#     points: [{name: "т контур::1", full: "A::т контур::1",
+#               x: ..., y: ..., z: ..., planar_offset: 0.0,
+#               radial_offset: 19.05}, ...]}
+```
+Read-only export of the working coordinates (+ stored probe/reflector
+offsets) of a point group or of an explicit point list, for the agent to
+analyze on its own. `include_offsets=False` skips the per-point offset step
+(halves the COM round trips on large groups); point names come back in group
+order.
 
 ---
 

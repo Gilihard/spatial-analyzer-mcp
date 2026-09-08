@@ -162,6 +162,85 @@ def sa_has_visible_window(pid: int | None = None) -> bool:
     return bool(found)
 
 
+def sa_main_window_title(pid: int | None = None) -> str:
+    """Title of the SA GUI's main window ('' if none can be found).
+
+    Used to detect which job file SA currently has open: when the caption
+    carries the file name (e.g. "SpatialAnalyzer - C:\\job\\file.xit" or a
+    bare "... - file.xit"), automation can tell that the requested file is
+    already loaded and skip the discard-and-reload. The main window is taken
+    as the largest visible top-level window of the SA GUI process(es) that is
+    not a #32770 dialog and has a non-empty title. Pure user32, no COM.
+    """
+    wanted = {pid} if pid is not None else set(sa_gui_pids())
+    if not wanted:
+        return ""
+    user32 = ctypes.windll.user32
+    best = ["", -1]  # (title, window area in px^2)
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _lparam):  # noqa: ANN001 - ctypes callback signature
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value not in wanted or not user32.IsWindowVisible(hwnd):
+            return True
+        cls = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, cls, 128)
+        if cls.value == DIALOG_CLASS:  # a dialog, not the main frame
+            return True
+        title = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, title, 512)
+        if not title.value:
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        area = (rect.right - rect.left) * (rect.bottom - rect.top)
+        if area > best[1]:
+            best[0], best[1] = title.value, area
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return best[0]
+
+
+def kill_sa(kill_engine: bool = True) -> dict:
+    """Force-terminate the SA GUI process(es) and, optionally, the SDK engine.
+
+    Last-resort recovery for a wedged SA that cannot be driven (SDK listener
+    dead, every MP step times out): kill the GUI and any leaked engine, then
+    relaunch with the target file. Force-kill discards unsaved in-memory job
+    state, so callers should save the current job first when its file is
+    known. taskkill via subprocess, no COM.
+
+    Returns:
+        {"killed": [{pid, ok, detail}], "still_running": [pid, ...], "error"?}
+    """
+    targets = sa_gui_pids()
+    if kill_engine:
+        targets += sa_engine_pids()
+    if not targets:
+        return {"killed": [], "still_running": [], "error": None}
+    killed = []
+    for pid in targets:
+        try:
+            r = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, text=True, timeout=30,
+            )
+            killed.append({"pid": pid, "ok": r.returncode == 0,
+                           "detail": (r.stdout or r.stderr or "").strip()})
+        except Exception as exc:  # noqa: BLE001 - one failure must not stop us
+            killed.append({"pid": pid, "ok": False, "detail": str(exc)})
+    deadline = time.time() + 15
+    while time.time() < deadline:  # let the OS reap the processes
+        if not sa_gui_pids() and not (kill_engine and sa_engine_pids()):
+            break
+        time.sleep(0.5)
+    still = sa_gui_pids() + (sa_engine_pids() if kill_engine else [])
+    return {"killed": killed, "still_running": still, "error": None}
+
+
 def _top_windows(pids: set[int]) -> list[tuple[int, str, str]]:
     """(hwnd, class-name, title) of every top-level window owned by `pids`."""
     user32 = ctypes.windll.user32

@@ -174,12 +174,71 @@ on any thread, do not touch the COM worker):
   closed by messages (a wedged engine thread) — harmless, and the real cure
   for a wedged ENGINE is still the documented taskkill (the watchdog never
   kills anything).
-- Tools: `sa_dismiss_dialogs` (one-shot; call it, then retry the stuck step)
-  and `sa_dialog_watchdog` (`start`/`stop`/`status`, optional `title_contains`
-  filter). The watchdog auto-starts on connect; an explicit `stop` disarms it
-  for the session (`auto: false`) — use that when an operator is working the
-  SA GUI by hand and must not have dialogs yanked. Offline regression:
-  `python _t_dialogs.py` (pops real MessageBoxes, no SA/COM needed).
+- **The watchdog only acts while a COM call is in flight (2026-09-08).**
+  `_watchdog_loop` skips every scan unless `sa.is_busy()` — the bridge worker
+  is executing a submitted task, i.e. the server is actually waiting on SA and
+  a dialog that pops right then is a step-blocker. `sa_sdk.SABridge` counts
+  in-flight tasks (`_busy` counter around `task.func(...)` in the worker) and
+  exposes `is_busy()`. When the bridge is idle, SA is either doing nothing or
+  being driven by a HUMAN, and no window is closed. This fixed the operator
+  complaint that auto-close yanked the windows used for manual construction
+  and killed the save-on-exit prompt (SA then could not be closed): those
+  appear with no MCP step running, so the watchdog now leaves them alone. A
+  dialog that pops between steps is still cured: the NEXT step blocks on it,
+  the moment that step runs the bridge is busy, and the watchdog dismisses it
+  within one interval. A manual `sa_dialog_watchdog stop` is still available;
+  with the gate it is only needed when hand-work and a COM step overlap (a
+  construction dialog kept open while the bot runs a step).
+- Tools: `sa_dismiss_dialogs` (one-shot, UNCONDITIONAL — it closes even a
+  dialog a human is looking at; call it deliberately, then retry the stuck
+  step) and `sa_dialog_watchdog` (`start`/`stop`/`status`, optional
+  `title_contains` filter). Offline regressions: `python _t_dialogs.py` (pops
+  real MessageBoxes, no SA/COM needed) and `python _t_openlogic.py`
+  (watchdog-gate + attach-detection logic, no SA/COM needed).
+
+**Current job file — attach, don't reload (2026-09-08).**
+Operator bug: "ask to work on a file that is already open → the server cannot
+tell and reloads it from disk (or cannot attach)". Root cause: SA 2015's SDK
+has NO way to report which file the GUI has open — no MP step and no COM
+property (verified against `CSpatialAnalyzerSDK.h` and the MP Command
+Reference). `Open SA File` always DISCARDS the current job, so re-opening an
+already-loaded file silently throws away unsaved in-memory state (previous
+fits, manual GUI edits). `sa_ensure_file(file_path)` is the file-first
+bootstrap that fixes the flow; `sa_current_file()` shows the evidence so a
+client can decide before opening. Detection uses the two signals that exist:
+- `_OPEN` (server.py): what THIS server process loaded/launched last
+  (`_track_open` — set by `sa_open_file` on a successful plain open, by
+  `sa_ensure_running` when it launches SA with the file, by `sa_launch`).
+- The SA main-window caption (`sa_app.sa_main_window_title` — the largest
+  visible non-#32770 top-level window of the GUI process, EnumWindows, no
+  COM): when the caption carries the file name (full path or bare), it also
+  catches a job the operator opened by hand or an earlier MCP session left
+  open. Matching is case-insensitive (`_title_mentions`); a caption naming a
+  DIFFERENT .xit than the tracker marks the tracker stale (`tracked-stale`).
+Neither signal is proof: if the caption is generic and this process never
+opened the file, `sa_ensure_file` cannot confirm and falls through to open.
+Flow of `sa_ensure_file` (per the operator's spec "attach to the already
+open one; if that fails, force close and open again"):
+1. Bootstrap: `sa_ensure_running(file_path=...)` — SA cold → launched WITH the
+   file (already the loaded job → attach via `tracked`); SA warm → connect.
+2. Attach: if `_current_open_evidence` says the requested file is loaded,
+   skip the SDK open entirely (`already_open: True`, `opened: False`) — later
+   steps then run against the live job, in-memory state preserved.
+3. Save-before-switch: the current job is about to be discarded, so run the
+   MP `Save` step first when it has a name (best-effort; an unnamed job pops a
+   Save-As dialog that the watchdog cancels → step fails → skipped).
+4. SDK open of the requested file (`_open_file_sdk` — the same step
+   `sa_open_file` uses).
+5. Failed open OR failed initial Connect while SA is running (wedged
+   listener) → force-restart recovery (`force_restart`, default True):
+   `sa_app.kill_sa()` (taskkill on every `Spatial Analyzer.exe` +
+   `SpatialAnalyzerSDK.exe`), `_reset_bridge()` (the old bridge's engine died
+   with SA; without the reset the stale `connected=True` would make every step
+   fail against the dead proxy), then `sa_ensure_running(file_path=...)`
+   relaunches SA with the file. A restart discards unsaved changes of the
+   previous job — that is the operator-sanctioned last resort.
+`sa_open_file` keeps its raw discard semantics (documented) but now also
+updates `_OPEN`. Offline logic regression: `python _t_openlogic.py`.
 
 **Connect speed (measured):** with the SA GUI already running,
 `sa_ensure_running()` connects in ~0.2 s — no artificial delay anywhere. The
@@ -227,12 +286,15 @@ programmatic values — never as inline REPL literals.
 - Debug via Inspector: `npx -y @modelcontextprotocol/inspector python server.py`
 - Syntax check: `python -m py_compile sa_sdk.py sa_app.py server.py test_sdk.py`
 - Dialog-dismissal regression (no SA, no COM): `python _t_dialogs.py`
+- Attach/watchdog-gate logic regression (no SA, no COM): `python _t_openlogic.py`
 - Geometry-identification regression (no SA, no COM): `python _t_identify.py`
 - Compare/vector-group live harness (needs SA free): `python _live_vectors.py`
 
 ## Tools (server.py)
 - Process: `sa_is_running`, `sa_launch`, `sa_ensure_running`, `sa_open_file`
   (opens/imports a `.xit` via `Open SA File`/`Import SA File`).
+- File bootstrap: `sa_ensure_file`, `sa_current_file` — attach-first open of a
+  job file (see "Current job file — attach, don't reload" below).
 - Dialogs: `sa_dismiss_dialogs`, `sa_dialog_watchdog` (see "Modal dialogs
   mid-work are auto-closed" above).
 - Connect: `sa_status`, `sa_connect`.
@@ -247,6 +309,23 @@ programmatic values — never as inline REPL literals.
   `Make a Collection Object Name Ref List - By Type`), each entry a FULL
   hierarchical name ("A::т контур"); optionally the points in each point group
   (names like "т контур::1"; a 376-point group adds ~0.1 s).
+- Raw point data: `sa_point_coordinates` — READ-ONLY export of the working
+  coordinates (+ stored probe/reflector offsets) of a point group or of an
+  explicit point list, for client-side analysis that needs the measurements
+  themselves rather than a fit verdict. Sources mirror
+  `sa_best_fit_from_points`/`sa_identify_geometry`: `point_group` (bare name
+  in `collection` or full "C::G") OR `points` (full "C::G::T" /
+  group-relative "G::T" / bare with `group`, any groups/collections). Returns
+  `points` in group/argument order (each {name, full, x, y, z,
+  planar_offset, radial_offset}) + `bounds` {min, max, centroid} computed
+  from what was returned, `total_points`/`truncated`, `unresolved`. No new SA
+  steps — it is the same live-confirmed `Get Point Coordinate` / `Get Point
+  Properties` / `Make a Point Name Ref List From a Group` plumbing the
+  fit-quality tools already use; nothing is created in SA.
+  `include_offsets=False` skips the per-point offset step (halves COM round
+  trips on large reads; offset keys read 0.0). `max_points` caps the first N
+  points of a huge group. The tool itself is NOT yet exercised live (add a
+  `_live_points.py`-style check next time SA is free).
 - Best fit: `sa_best_fit` + `sa_best_fit_{plane,sphere,cylinder,cone,circle,line}`.
 - Best fit from an explicit point list: `sa_best_fit_from_points` — fits
   exactly the named points wherever they live (subset of one group, or points
@@ -777,7 +856,20 @@ background watchdog `sa_dialog_watchdog` (armed automatically by
 title filter). Pure sa_app/ctypes — never touches COM. Verified offline
 against real MessageBoxes (`python _t_dialogs.py`: MB_OK / MB_OKCANCEL /
 MB_YESNO all close); the engine's INVISIBLE #32770 splash/about window (no
-buttons) is deliberately not treated as a blocking dialog.
+buttons) is deliberately not treated as a blocking dialog. Since 2026-09-08
+the watchdog is GATED: it scans only while a COM call is in flight on the
+bridge (`SABridge.is_busy()`), so manual GUI work (construction dialogs, the
+save-on-exit prompt) is never interrupted — see "Modal dialogs mid-work are
+auto-closed" above.
+
+Attach-first job open (2026-09-08): `sa_ensure_file` (open a file, attaching
+to the already-open copy instead of discarding+reloading it — SA's SDK cannot
+report the loaded file, so detection uses the session tracker `_OPEN` and the
+SA window caption via `sa_app.sa_main_window_title`) + `sa_current_file`
+(evidence report). Force-restart recovery for a failed open:
+`sa_app.kill_sa` + `server._reset_bridge` + relaunch with the file. Offline
+logic regression: `python _t_openlogic.py`. See "Current job file — attach,
+don't reload" above for the full design.
 
 Graphics view control (2026-09-04): `sa_show_objects` / `sa_hide_objects` /
 `sa_show_points` / `sa_hide_points` / `sa_show_hide_by_type` set the

@@ -13,6 +13,7 @@ Connect from a client via stdio. See AGENTS.md / README.md for config.
 import logging
 import math
 import os
+import re
 import threading
 import time
 
@@ -90,6 +91,24 @@ def _ensure_sa(host: str = "localhost"):
     return sa
 
 
+def _reset_bridge() -> None:
+    """Drop the shared bridge so the next _ensure_sa creates a fresh engine.
+
+    Required after force-killing the SA GUI and its SDK engine (sa_ensure_file
+    force-restart): the old bridge still believes it is connected, but its
+    out-of-process COM server is dead - re-using it would make every MP step
+    fail against the stale proxy instead of the relaunched SA.
+    """
+    global sa
+    b = sa
+    sa = None
+    if b is not None:
+        try:
+            b.shutdown()
+        except Exception:  # noqa: BLE001 - the engine may already be dead
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Background modal-dialog watchdog
 #
@@ -101,6 +120,14 @@ def _ensure_sa(host: str = "localhost"):
 # dialogs. It is armed lazily by _ensure_bridge() on the first tool call that
 # needs COM, so every SA-driving session is protected from step 1; a manual
 # sa_dialog_watchdog "stop" disarms it for the rest of the session.
+#
+# IMPORTANT: the watchdog acts ONLY while a COM task is running on the bridge
+# (sa.is_busy()) - that is the only time the server is waiting on SA and a
+# dialog that pops is a step-blocker. While the bridge is idle, SA is being
+# driven by a HUMAN (or sitting idle): construction dialogs, the save-on-exit
+# prompt and every other window the operator uses are left strictly alone, so
+# auto-close can no longer yank the windows the user works in or make SA
+# impossible to close.
 # ---------------------------------------------------------------------------
 _WATCH_LOCK = threading.Lock()
 _WATCH = {
@@ -129,10 +156,32 @@ def _watchdog_status() -> dict:
         }
 
 
+def _watchdog_gate() -> bool:
+    """Should the watchdog scan for dialogs right now?
+
+    True only while a COM task is in flight on the bridge - the only time the
+    server is waiting on SA and a just-popped dialog is a step-blocker. When
+    the bridge is idle, SA is idle or being driven by a human, and no window
+    may be closed (see the section comment above).
+    """
+    bridge = sa
+    return bridge is not None and bridge.is_busy()
+
+
 def _watchdog_loop() -> None:
     while True:
         if _WATCH["stop"].wait(_WATCH["interval_s"]):
             return
+        # Gate: only dismiss dialogs while a COM task is in flight, i.e. while
+        # the server itself is waiting on SA and a dialog that pops then is a
+        # step-blocker. When the bridge is idle, SA is either doing nothing or
+        # being driven by a HUMAN (construction dialogs, the save-on-exit
+        # prompt, ...) - closing those windows is exactly the reported bug
+        # ("auto-close kills the windows I work in and I cannot close SA").
+        # The launch path has its own pid-scoped dismissals, so no COM task
+        # means: scan nothing.
+        if not _watchdog_gate():
+            continue
         try:
             res = sa_app.dismiss_sa_dialogs(
                 title_contains=_WATCH["title_contains"] or None)
@@ -179,6 +228,99 @@ def _ensure_watchdog() -> None:
     """Arm the auto-closer (idempotent). A manual 'stop' disarms it."""
     if _WATCH["auto"]:
         _watchdog_start()
+
+
+# ---------------------------------------------------------------------------
+# Current-job-file tracking + attach-first detection
+#
+# SA 2015's SDK exposes NO way to ask the GUI which file it has open (no MP
+# step, no COM property - verified against the SDK header and MP Command
+# Reference). "Open SA File" always DISCARDS the current job, so blindly
+# re-opening a file that is already loaded silently throws away the in-memory
+# state (previous fits, manual GUI edits). To attach to an already-open job
+# instead of reloading it, sa_ensure_file() uses the two signals that DO
+# exist:
+#   * _OPEN - what THIS server process opened/launched last. Updated by every
+#     tool that loads a job (sa_open_file, sa_ensure_running's launch path,
+#     sa_launch). Empty on a fresh process (SA may still be running with a job
+#     from an earlier session or manual work).
+#   * The SA main-window caption - when it carries the file name, it also
+#     catches jobs loaded by the user or by an earlier MCP session.
+# If neither signal identifies the requested file, the file is opened via the
+# SDK (saving the current job first when its file is known); a failed open
+# falls back to force-restarting SA with the file (see sa_ensure_file).
+# ---------------------------------------------------------------------------
+_OPEN_LOCK = threading.Lock()
+_OPEN = {"path": None, "how": None, "at": None}
+
+
+def _normalize_job_path(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    except Exception:  # noqa: BLE001 - keep the raw value on odd input
+        return str(path)
+
+
+def _track_open(path: str | None, how: str) -> None:
+    """Remember which job file this server process loaded/launched."""
+    with _OPEN_LOCK:
+        _OPEN["path"] = _normalize_job_path(path) if path else None
+        _OPEN["how"] = how
+        _OPEN["at"] = time.time()
+
+
+def _tracked_open() -> tuple[str | None, str | None, float | None]:
+    with _OPEN_LOCK:
+        return _OPEN["path"], _OPEN["how"], _OPEN["at"]
+
+
+def _sa_window_title() -> str:
+    try:
+        return sa_app.sa_main_window_title() or ""
+    except Exception:  # noqa: BLE001 - caption is advisory only
+        return ""
+
+
+def _title_mentions(title: str, norm_path: str | None) -> bool:
+    """Does the SA caption name this job file (full path or bare name)?"""
+    if not title or not norm_path:
+        return False
+    t = title.lower()
+    base = os.path.basename(norm_path).lower()
+    return (norm_path.lower() in t) or (base in t)
+
+
+def _title_has_xit(title: str) -> bool:
+    return ".xit" in title.lower()
+
+
+def _current_open_evidence(file_path: str) -> dict:
+    """Best available answer to 'is `file_path` the job SA has open?'.
+
+    Returns {loaded, how, tracked_path, window_title, requested_path}. how is
+    'tracked' (this server opened it), 'window-title' (the caption names it),
+    'tracked-stale' (the caption names a DIFFERENT file, so the tracker no
+    longer reflects the loaded job), or None.
+    """
+    norm = _normalize_job_path(file_path)
+    tpath, _thow, _tat = _tracked_open()
+    title = _sa_window_title()
+    ev = {"loaded": False, "how": None, "tracked_path": tpath,
+          "window_title": title, "requested_path": norm}
+    tracked_same = bool(tpath) and tpath == norm
+    caption_same = _title_mentions(title, norm)
+    if caption_same:
+        ev["loaded"], ev["how"] = True, "window-title"
+        return ev
+    if tracked_same:
+        if _title_has_xit(title) and not _title_mentions(title, tpath):
+            # The caption names some OTHER .xit: the job changed behind us
+            # (manual File > Open / New), the tracker is stale. Do not attach.
+            ev["how"] = "tracked-stale"
+        else:
+            # Caption is empty, generic, or consistent with the tracker.
+            ev["loaded"], ev["how"] = True, "tracked"
+    return ev
 
 
 mcp = FastMCP("spatial-analyzer")
@@ -273,7 +415,9 @@ def sa_dismiss_dialogs(title_contains: str = "") -> dict:
     button - a plain MB_OK error box has no close button, only OK ends it).
     It needs no COM, so it works even while a step is stuck; call it and then
     retry the step. The background auto-closer (sa_dialog_watchdog) does the
-    same continuously once a bridge exists.
+    same continuously once a bridge exists, but ONLY while a COM call is in
+    flight - this one-shot call closes dialogs unconditionally, so use it
+    deliberately (it will also close a dialog a human is looking at).
 
     Args:
         title_contains: Optional; only close dialogs whose title contains
@@ -297,15 +441,21 @@ def sa_dialog_watchdog(action: str = "status",
     """Manage the background auto-closer of SA modal dialogs.
 
     The watchdog is armed automatically when the first COM tool call connects
-    the bridge: every interval_s seconds it scans the SA GUI + SDK engine
-    processes and closes blocking #32770 dialogs, so a dialog that pops
-    mid-step stops hanging the session (the stuck COM call completes as soon
-    as the dialog is closed). Pure sa_app/ctypes - it never touches COM, so it
-    cannot wedge the bridge.
+    the bridge. It scans the SA GUI + SDK engine processes and closes blocking
+    #32770 dialogs, so a dialog that pops mid-step stops hanging the session
+    (the stuck COM call completes as soon as the dialog is closed). Pure
+    sa_app/ctypes - it never touches COM, so it cannot wedge the bridge.
 
-    Use 'stop' if you are operating SA's GUI by hand and do not want dialogs
-    auto-closed (this disarms it for the rest of the session); 'start' re-arms
-    it.
+    IMPORTANT: dialogs are dismissed ONLY while a COM call is actually in
+    flight (the server waiting on SA). When no MCP step is running, SA is idle
+    or being driven by hand and NO window is touched - construction dialogs,
+    the save-on-exit prompt, etc. are left alone, so the auto-closer cannot
+    interfere with manual work or make SA impossible to close.
+
+    A manual 'stop' disarms it for the rest of the session; 'start' re-arms
+    it. Use 'stop' while operating SA's GUI by hand if a COM step and manual
+    work would ever overlap (e.g. you keep a construction dialog open while
+    the bot runs a step).
 
     Args:
         action: "status" (default) | "start" | "stop".
@@ -361,6 +511,8 @@ def sa_launch(
         except Exception as exc:  # noqa: BLE001
             res["connected"] = False
             res["error"] = (res.get("error") or "") + f" connect failed: {exc}"
+    if res.get("launched") and file_path:
+        _track_open(file_path, "sa_launch")
     return res
 
 
@@ -444,6 +596,9 @@ def sa_ensure_running(
             time.sleep(1)
     if out["connected"]:
         out["error"] = None
+        if out.get("launched") and file_path:
+            # SA was launched with the file: it IS the loaded job now.
+            _track_open(file_path, "sa_ensure_running")
     else:
         out["error"] = (f"{last_err} " if last_err else "") + \
             "Connect() did not succeed in time. Check SA menu: " \
@@ -454,6 +609,24 @@ def sa_ensure_running(
 # ---------------------------------------------------------------------------
 # Tool: open a project file in an already-running SA (via SDK step)
 # ---------------------------------------------------------------------------
+def _open_file_sdk(file_path: str, embedded: bool = False) -> dict:
+    """Run the 'Open SA File' MP step (DISCARDS the current job).
+
+    Shared by sa_open_file and sa_ensure_file so both report identically.
+    Returns the _try_steps report ({opened, step, status_code, status,
+    messages, error?, ...}).
+    """
+    def set_args(step):
+        sa.set_file_path_arg("SA File Name", file_path, embedded)
+
+    return _try_steps(
+        candidates=("Open SA File",),
+        set_args=set_args,
+        read_outputs=lambda: {},
+        result_key="opened",
+    )
+
+
 @mcp.tool()
 def sa_open_file(file_path: str, import_mode: bool = False,
                  embedded: bool = False) -> dict:
@@ -471,6 +644,13 @@ def sa_open_file(file_path: str, import_mode: bool = False,
         Boolean "Allow Operator Selections" (True pops a picker; False
         imports everything silently).
 
+    NOTE: opening always replaces the loaded job, so if the file is ALREADY
+    open this reloads it and discards unsaved in-memory state. For an
+    attach-first flow that reuses the already-open job instead, use
+    sa_ensure_file() - it detects the open copy (window caption / what this
+    session loaded) and skips the reload, force-restarting SA only if the
+    open cannot succeed.
+
     Args:
         file_path: Absolute path to the .xit file (or embedded-file name if
                    `embedded`).
@@ -487,20 +667,230 @@ def sa_open_file(file_path: str, import_mode: bool = False,
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
         return {"opened": False, "error": str(exc)}
-    arg_name = "SA File Name"
+    if import_mode:
+        def set_args(step):
+            sa.set_file_path_arg("SA File Name", file_path, embedded)
+            if step == "Import SA File":
+                sa.set_bool_arg("Allow Operator Selections", False)
 
-    def set_args(step):
-        sa.set_file_path_arg(arg_name, file_path, embedded)
-        if step == "Import SA File":
-            sa.set_bool_arg("Allow Operator Selections", False)
+        return _try_steps(
+            candidates=("Import SA File", "Open SA File"),
+            set_args=set_args,
+            read_outputs=lambda: {},
+            result_key="opened",
+        )
+    res = _open_file_sdk(file_path, embedded)
+    if res.get("opened"):
+        _track_open(file_path, "Open SA File")
+    return res
 
-    return _try_steps(
-        candidates=("Import SA File", "Open SA File") if import_mode
-                 else ("Open SA File",),
-        set_args=set_args,
-        read_outputs=lambda: {},
-        result_key="opened",
-    )
+
+# ---------------------------------------------------------------------------
+# Tool: which job file does SA currently appear to have loaded?
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def sa_current_file() -> dict:
+    """Report which job file SA currently appears to have loaded.
+
+    SA 2015's SDK cannot say what file the GUI has open (no MP step, no COM
+    property), so this returns the evidence the attach-first open
+    (sa_ensure_file) uses:
+      - tracked_file: the job file THIS server process opened/launched last
+        (empty on a fresh process, e.g. a new MCP session);
+      - window_title: the SA main-window caption - if it carries a file name
+        (e.g. "... - job.xit"), it also reveals a job loaded by hand or by an
+        earlier MCP session;
+      - current_file: the best guess, if one can be derived.
+    COM-free (never creates the bridge), so it is safe to call anytime. Use it
+    before sa_ensure_file / sa_open_file when you need to know what is loaded.
+
+    Returns:
+        {tracked_file, tracked_how, window_title, current_file, error?}
+    """
+    tpath, thow, _tat = _tracked_open()
+    title = _sa_window_title()
+    current = None
+    if tpath and (not _title_has_xit(title)
+                  or _title_mentions(title, tpath)):
+        current = tpath  # the tracker's file is still the loaded job
+    if _title_has_xit(title):
+        # The caption names a file; prefer it when it contradicts the tracker.
+        cand = _caption_file_token(title)
+        if cand:
+            current = cand
+    return {"tracked_file": tpath, "tracked_how": thow,
+            "window_title": title, "current_file": current, "error": None}
+
+
+def _caption_file_token(title: str) -> str | None:
+    """The .xit file name a SA caption embeds (bare name or path), if any.
+
+    Advisory only (sa_current_file / evidence): find the ".xit"-terminated
+    token in the caption, trimmed at the nearest space / dash / backslash.
+    """
+    best = None
+    for m in re.finditer(r"\.xit\d*", title, re.IGNORECASE):
+        start = max(title.rfind(" ", 0, m.start()),
+                    title.rfind("-", 0, m.start()),
+                    title.rfind("\\", 0, m.start())) + 1
+        token = title[start:m.end()].strip(" -")
+        if len(token) > len(best or ""):
+            best = token
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Tool: attach to / open a job file (the file-first bootstrap)
+# ---------------------------------------------------------------------------
+def _save_current_job_if_named() -> bool:
+    """Best-effort 'Save' of the current job under its own file name.
+
+    Runs the MP 'Save' step (saves using the current filename). An unnamed
+    job pops a Save-As dialog, which the watchdog auto-cancels, so the step
+    fails and this returns False - the caller then discards the job knowing it
+    was never named. Returns True only when the save really happened.
+    """
+    try:
+        _ensure_sa()
+        sa.set_step("Save")
+        ok = sa.execute_step()
+        return bool(ok and sa.get_step_result() == 2)
+    except Exception:  # noqa: BLE001 - best effort, never block an open
+        return False
+
+
+def _force_restart_with_file(file_path: str, host: str, timeout: float,
+                             saved: bool, evidence: dict) -> dict:
+    """Last-resort recovery: kill SA (+ engine), relaunch it with the file.
+
+    Reached when the requested file could not be attached or opened through
+    the SDK (SA wedged, listener dead, open step failed). taskkill on every
+    SA GUI + SDK engine process, reset the bridge (its engine died with SA),
+    then sa_ensure_running(file_path=...) relaunches SA with the file.
+    A restart discards unsaved changes of the previous job - the
+    operator-sanctioned deterministic last resort.
+    """
+    killed = sa_app.kill_sa()
+    if sa_app.sa_gui_pids():
+        return {"attached": False, "already_open": False, "opened": False,
+                "restarted": False, "previous_job_saved": saved,
+                "evidence": evidence, "killed": killed,
+                "error": "Force-restart failed: SA processes did not exit. "
+                         "Close SA manually and retry."}
+    _reset_bridge()  # the old bridge's engine died with SA - start fresh
+    rel = sa_ensure_running(file_path=file_path, host=host, timeout=timeout)
+    if rel.get("connected"):
+        return {"attached": True, "already_open": False, "opened": True,
+                "restarted": True, "previous_job_saved": saved,
+                "evidence": _current_open_evidence(file_path),
+                "killed": killed, "error": None}
+    return {"attached": False, "already_open": False, "opened": False,
+            "restarted": True, "previous_job_saved": saved,
+            "evidence": _current_open_evidence(file_path), "killed": killed,
+            "error": rel.get("error")
+            or "SA restarted but could not connect. Check Utilities > SDK "
+               "Settings and retry."}
+
+
+@mcp.tool()
+def sa_ensure_file(
+    file_path: str,
+    host: str = "localhost",
+    timeout: float = 60.0,
+    force_restart: bool = True,
+    save_current: bool = True,
+) -> dict:
+    """Make SA work on `file_path`, ATTACHING to an already-open copy.
+
+    Call this before acting on a job file. SA holds one job at a time, and its
+    'Open SA File' step DISCARDS whatever is loaded and reloads from disk -
+    re-opening a file that is already open would silently throw away unsaved
+    in-memory state (previous fits, manual GUI edits). SA 2015's SDK cannot
+    report which file the GUI has open, so this tool first checks the two
+    signals that do exist:
+      1. the file THIS server session loaded/launched (sa_open_file /
+         sa_ensure_running / sa_launch), and
+      2. the SA main-window caption (catches a job the user opened by hand or
+         an earlier MCP session left open).
+    If either says `file_path` is already the loaded job, nothing is reloaded
+    - the SDK bridge is simply connected and the live job is used
+    (already_open: True). Otherwise the file is opened normally, with the
+    current job saved first when its own file is known (`save_current`). If
+    the file cannot be attached or opened through the SDK at all (SA wedged,
+    listener dead, open step failed), it force-closes SA and relaunches it
+    with the file (`force_restart`) - the deterministic recovery; a restart
+    discards unsaved changes of the previous job, so enable it only when the
+    requested file must end up loaded.
+
+    Args:
+        file_path: Absolute path to the .xit file to work on.
+        host: SA SDK host (default 'localhost').
+        timeout: Seconds to wait for the GUI (launch path) / SDK connect.
+        force_restart: If True, when the SDK open fails, kill SA and relaunch
+                       it with the file (default True).
+        save_current: Save the current job first when its file is known
+                      (default True).
+
+    Returns:
+        {attached, already_open, opened, restarted, previous_job_saved,
+         evidence ({tracked_path, window_title, how}), step?, status?,
+         messages?, error?}
+    """
+    file_path = os.path.abspath(file_path)
+    if not os.path.isfile(file_path):
+        return {"attached": False, "already_open": False, "opened": False,
+                "restarted": False, "previous_job_saved": False,
+                "evidence": _current_open_evidence(file_path),
+                "error": f"File not found: {file_path}"}
+
+    # 1) SA running + SDK connected. On a cold start SA is launched with the
+    #    file, so by the time we return the file is already the loaded job.
+    ens = sa_ensure_running(file_path=file_path, host=host, timeout=timeout)
+    if not ens.get("connected"):
+        if force_restart and sa_app.is_sa_running():
+            # SA is up but not connectable (wedged SDK listener / leaked
+            # engine): the deterministic recovery is a clean restart.
+            return _force_restart_with_file(
+                file_path, host, timeout, False,
+                _current_open_evidence(file_path))
+        return {"attached": False, "already_open": False, "opened": False,
+                "restarted": False, "previous_job_saved": False,
+                "evidence": _current_open_evidence(file_path),
+                "error": ens.get("error") or "Could not connect to SA"}
+
+    # 2) Already the loaded job? Attach and do nothing else.
+    ev = _current_open_evidence(file_path)
+    if ev["loaded"]:
+        _track_open(file_path, ev["how"])
+        return {"attached": True, "already_open": True, "opened": False,
+                "restarted": False, "previous_job_saved": False,
+                "evidence": ev, "error": None}
+
+    # 3) The job is about to be discarded - save it first when it has a name.
+    saved = _save_current_job_if_named() if save_current else False
+
+    # 4) Normal SDK open of the requested file.
+    res = _open_file_sdk(file_path)
+    if res.get("opened"):
+        _track_open(file_path, res.get("step") or "Open SA File")
+        return {"attached": True, "already_open": False, "opened": True,
+                "restarted": False, "previous_job_saved": saved,
+                "evidence": _current_open_evidence(file_path),
+                "step": res.get("step"),
+                "status_code": res.get("status_code"),
+                "status": res.get("status"),
+                "messages": res.get("messages", []),
+                "error": None}
+
+    # 5) The open failed - last-resort recovery: kill SA, relaunch with file.
+    if not force_restart:
+        return {"attached": False, "already_open": False, "opened": False,
+                "restarted": False, "previous_job_saved": saved,
+                "evidence": ev,
+                "error": (res.get("error")
+                          or "Open SA File did not succeed. Retry, or call "
+                             "with force_restart=True to restart SA.")}
+    return _force_restart_with_file(file_path, host, timeout, saved, ev)
 
 
 # ---------------------------------------------------------------------------
@@ -3784,7 +4174,7 @@ def _point_ref_parts(full):
     return parts[0], parts[-2], parts[-1]
 
 
-def _read_selected_point_records(full_names):
+def _read_selected_point_records(full_names, include_offsets=True):
     """Read coordinates + stored offsets of exactly the given points.
 
     Unlike _read_group_points (which reads a WHOLE group), this reads only the
@@ -3792,6 +4182,8 @@ def _read_selected_point_records(full_names):
     out of a 376-point group stays fast. Returns (records, unresolved) where
     each record is {name, full, x, y, z, planar_offset, radial_offset} and
     unresolved lists the full names whose coordinates could not be read.
+    include_offsets=False skips the extra 'Get Point Properties' step (halves
+    the COM round trips on large reads); the offset keys stay 0.0.
     """
     records = []
     unresolved = []
@@ -3812,16 +4204,17 @@ def _read_selected_point_records(full_names):
                 "planar_offset": 0.0,
                 "radial_offset": 0.0,
             }
-            try:  # stored probe/reflector offsets (may be absent: keep 0)
-                sa.set_step("Get Point Properties")
-                sa.set_point_name_arg("Point Name", coll, group, target)
-                if sa.execute_step() and sa.get_step_result() == 2:
-                    rec["planar_offset"] = float(
-                        sa.get_double_arg("Planar Offset"))
-                    rec["radial_offset"] = float(
-                        sa.get_double_arg("Radial Offset"))
-            except Exception:  # noqa: BLE001 - offsets are optional
-                pass
+            if include_offsets:
+                try:  # stored probe/reflector offsets (may be absent: keep 0)
+                    sa.set_step("Get Point Properties")
+                    sa.set_point_name_arg("Point Name", coll, group, target)
+                    if sa.execute_step() and sa.get_step_result() == 2:
+                        rec["planar_offset"] = float(
+                            sa.get_double_arg("Planar Offset"))
+                        rec["radial_offset"] = float(
+                            sa.get_double_arg("Radial Offset"))
+                except Exception:  # noqa: BLE001 - offsets are optional
+                    pass
             records.append(rec)
         except Exception:  # noqa: BLE001 - one bad point must not kill the run
             unresolved.append(str(full))
@@ -4385,6 +4778,136 @@ def sa_identify_geometry(
         ],
         "notes": cls["notes"],
         "point_source": source,
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Raw point data export.
+#
+# The steps behind this section ('Get Point Coordinate', 'Get Point
+# Properties', 'Make a Point Name Ref List From a Group') are the same
+# live-confirmed SA 2015 plumbing the fit-quality chain already uses
+# internally (sa_fit_quality / sa_best_fit_from_points / sa_identify_geometry
+# call _read_group_points / _read_selected_point_records). This tool only
+# EXPOSES the raw measurements to the client - an analysis agent that needs
+# the point coordinates themselves, not a fit verdict. Nothing is created or
+# modified in SA.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def sa_point_coordinates(
+    point_group: str = "",
+    collection: str = "",
+    points: list[str] | None = None,
+    group: str = "",
+    include_offsets: bool = True,
+    max_points: int | None = None,
+) -> dict:
+    """Read the working coordinates (and stored offsets) of points.
+
+    Hands the raw measurements of a point group or of individual points to
+    the client for direct analysis (spread, distances, custom fits, ...) -
+    read-only, nothing is created in SA. Every returned point carries its
+    coordinates in the current working frame plus, when stored, its
+    probe/reflector offsets (the same data SA's own fits compensate for; both
+    are 0.0 for points without stored offsets). Point source is one of:
+      - point_group: an existing point group (bare name inside `collection`,
+        or a full "C::G" name), or
+      - points: individual points - full "C::G::T", group-relative "G::T"
+        (resolved inside `collection`), or bare targets (resolved against
+        `group`); they may span several groups and collections.
+    At least one source is required, and only one of the two.
+
+    Names come back in group/argument order. Coordinates are read one
+    'Get Point Coordinate' step per point; with `max_points` only the first N
+    points are read (`truncated: True`, and `bounds` then describe the
+    returned subset, not the whole group). `include_offsets=False` skips the
+    per-point 'Get Point Properties' step (halves the COM round trips on
+    large groups; the offset keys are then 0.0).
+
+    Args:
+        point_group: Read a whole point group (default "" = not used).
+        collection: Collection of the group / of simple names in `points`.
+        points: Individual points to read instead of a whole group.
+        group: Point group hint for bare target names in `points`.
+        include_offsets: Also read each point's stored probe/reflector
+                         offsets (one extra step per point).
+        max_points: Cap the number of returned points (None = no cap). Use
+                    for very large groups to keep the response small.
+
+    Returns:
+        {ok, source, count, total_points, truncated, offsets_read, bounds
+         ({min, max, centroid} as [x, y, z]), points (list of {name, full, x,
+         y, z, planar_offset, radial_offset}), unresolved, error?}
+    """
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    if point_group and points:
+        return {"ok": False, "error": (
+            "Give one point source only: point_group or points.")}
+    if not point_group and not points:
+        return {"ok": False, "error": (
+            "Provide a point source: 'point_group' (a whole group) or "
+            "'points' (individual points).")}
+
+    # Normalize the source into a list of joined full "C::G::T" names, then
+    # read them all with the same helper the fit tools use.
+    fulls = []
+    total = 0
+    source = {}
+    if point_group:
+        full = _object_full_name(point_group, collection)
+        rel_names = _points_in_group(full)
+        if not rel_names:
+            return {"ok": False, "error": (
+                f"Point group '{point_group}' not found or empty."),
+                "source": {"type": "point_group", "group": point_group,
+                           "collection": collection}}
+        coll, bare = (full.split("::", 1) if "::" in full else ("", full))
+        source = {"type": "point_group", "group": bare, "collection": coll}
+        total = len(rel_names)
+        if max_points is not None and max_points > 0:
+            rel_names = rel_names[:max_points]
+        for rel in rel_names:
+            fulls.append(f"{coll}::{rel}" if coll else f"::{rel}")
+    else:
+        if any("::" not in str(p) for p in points) and not group:
+            return {"ok": False, "error": (
+                "Bare target names in 'points' need a 'group' to resolve "
+                "against.")}
+        fulls = [_point_full_name(p, group, collection) for p in points]
+        total = len(fulls)
+        if max_points is not None and max_points > 0:
+            fulls = fulls[:max_points]
+        source = {"type": "points", "requested": len(points)}
+
+    records, unresolved = _read_selected_point_records(
+        fulls, include_offsets=include_offsets)
+    if not records:
+        return {"ok": False, "source": source, "error": (
+            "Could not read coordinates of any of the given points."),
+            "unresolved": unresolved}
+    n = len(records)
+    pts = [[r["x"], r["y"], r["z"]] for r in records]
+    bounds = {
+        "min": [min(p[i] for p in pts) for i in range(3)],
+        "max": [max(p[i] for p in pts) for i in range(3)],
+        "centroid": [sum(p[i] for p in pts) / n for i in range(3)],
+    }
+    return {
+        "ok": True,
+        "source": source,
+        "count": n,
+        "total_points": total,
+        "truncated": n < total,
+        "offsets_read": include_offsets,
+        "bounds": bounds,
+        "points": records,
+        "unresolved": unresolved,
         "error": None,
     }
 
