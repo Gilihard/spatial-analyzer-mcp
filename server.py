@@ -332,10 +332,9 @@ mcp = FastMCP("spatial-analyzer")
 @mcp.tool()
 def sa_status() -> dict:
     """Report whether the MCP server is alive and connected to SA.
-
-    Use this first to confirm the server started and the COM bridge works.
-    Returns connection state and the SA host (if connected).
-    """
+    Call this first. Never creates the SDK bridge (like the other COM-free tools).
+    
+    Returns {connected, host, error?}."""
     if sa is None:
         return {"server_alive": True, "bridge_ok": False,
                 "connected": False,
@@ -355,20 +354,13 @@ def sa_status() -> dict:
 @mcp.tool()
 def sa_connect(host: str = "localhost") -> dict:
     """Connect the bridge to a running SpatialAnalyzer process.
-
-    SpatialAnalyzer MUST be open and its SDK listener enabled (SA menu:
-    Utilities > SDK Settings, or it listens by default). If SA is not running
-    this returns an error instead of spawning the SDK engine - an engine born
-    without a GUI listener pops a modal 10061 error and wedges; use
-    sa_ensure_running() to start SA first.
-
-    Args:
-        host: Hostname or IP of the machine running SA. Use "localhost" if SA
-              runs on this machine.
-
-    Returns:
-        {connected, host, error?}
-    """
+    SA must already be running with its SDK listener enabled (Utilities > SDK
+    Settings); if not, use sa_ensure_running() to launch it first - an engine born
+    without the listener pops a modal 10061 error and wedges it.
+    
+    Args: host: machine running SA ('localhost' if local).
+    
+    Returns {connected, host, error?}."""
     try:
         _ensure_bridge()
     except Exception as exc:  # noqa: BLE001
@@ -388,14 +380,10 @@ def sa_connect(host: str = "localhost") -> dict:
 @mcp.tool()
 def sa_is_running() -> dict:
     """Check whether the SpatialAnalyzer GUI process is running.
-
-    Looks for 'Spatial Analyzer.exe' in the OS process list (no COM call, so
-    it is safe and fast even if SA's SDK listener is wedged). Use this before
-    sa_launch / sa_connect to decide what to do.
-
-    Returns:
-        {running, exe_path?}  (exe_path is the discovered GUI executable)
-    """
+    No COM - safe even if SA's SDK listener is wedged. Use before sa_launch /
+    sa_connect.
+    
+    Returns {running, exe_path?, error?}."""
     return {"running": sa_app.is_sa_running(),
             "exe_path": sa_app.find_sa_exe()}
 
@@ -405,29 +393,19 @@ def sa_is_running() -> dict:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def sa_dismiss_dialogs(title_contains: str = "") -> dict:
-    """Close SA modal dialogs that are blocking MCP steps, right now.
-
-    SA pops a modal dialog mid-step (e.g. "Object Not Found" when an object
-    name is wrong) that blocks the MP step until a human clicks it away -
-    every MCP call then looks hung. This scans the SA GUI (and SDK engine)
-    processes and closes their dialog windows: WM_CLOSE first (Cancel/X), then
-    a button click on survivors (Cancel/No if present, else the single or OK
-    button - a plain MB_OK error box has no close button, only OK ends it).
-    It needs no COM, so it works even while a step is stuck; call it and then
-    retry the step. The background auto-closer (sa_dialog_watchdog) does the
-    same continuously once a bridge exists, but ONLY while a COM call is in
-    flight - this one-shot call closes dialogs unconditionally, so use it
-    deliberately (it will also close a dialog a human is looking at).
-
-    Args:
-        title_contains: Optional; only close dialogs whose title contains
-                        this text (case-insensitive). Empty = all #32770
-                        dialogs owned by SA.
-
-    Returns:
-        {closed: [{class_name, title, method}], still_open: [...],
-         scanned_pids: [...], error?}
-    """
+    """Close SA modal dialogs that are blocking an MCP step, right now.
+    A mid-step dialog (e.g. 'Object Not Found') blocks the step until clicked away.
+    Scans the SA GUI + engine processes and closes their #32770 dialogs (WM_CLOSE,
+    then a Cancel/No button click, else the single OK - a plain MB_OK box has no
+    close button). No COM needed, so it works even while a step is stuck: call it,
+    then retry the step. UNCONDITIONAL - it also closes a dialog a human is
+    looking at, so use it deliberately (the background sa_dialog_watchdog only
+    acts while a COM call is in flight; this one-shot does not wait).
+    
+    Args: title_contains: only close dialogs whose title contains this text
+          (case-insensitive).
+    
+    Returns {closed, still_open, scanned_pids, error?}."""
     return sa_app.dismiss_sa_dialogs(title_contains=title_contains or None)
 
 
@@ -438,34 +416,20 @@ def sa_dismiss_dialogs(title_contains: str = "") -> dict:
 def sa_dialog_watchdog(action: str = "status",
                        interval_s: float = 0.5,
                        title_contains: str = "") -> dict:
-    """Manage the background auto-closer of SA modal dialogs.
-
-    The watchdog is armed automatically when the first COM tool call connects
-    the bridge. It scans the SA GUI + SDK engine processes and closes blocking
-    #32770 dialogs, so a dialog that pops mid-step stops hanging the session
-    (the stuck COM call completes as soon as the dialog is closed). Pure
-    sa_app/ctypes - it never touches COM, so it cannot wedge the bridge.
-
-    IMPORTANT: dialogs are dismissed ONLY while a COM call is actually in
-    flight (the server waiting on SA). When no MCP step is running, SA is idle
-    or being driven by hand and NO window is touched - construction dialogs,
-    the save-on-exit prompt, etc. are left alone, so the auto-closer cannot
-    interfere with manual work or make SA impossible to close.
-
-    A manual 'stop' disarms it for the rest of the session; 'start' re-arms
-    it. Use 'stop' while operating SA's GUI by hand if a COM step and manual
-    work would ever overlap (e.g. you keep a construction dialog open while
-    the bot runs a step).
-
-    Args:
-        action: "status" (default) | "start" | "stop".
-        interval_s: Poll interval when (re)starting (default 0.5 s).
-        title_contains: Optional title filter (see sa_dismiss_dialogs).
-
-    Returns:
-        {action, running, interval_s, title_contains, auto, scans,
-         closed_total, last_closed?}
-    """
+    """Background auto-closer of SA modal dialogs (armed automatically on the first
+    COM call; also start/stop/status).
+    Polls the SA GUI + engine and closes blocking dialogs, so a mid-step modal
+    self-heals in about one interval instead of hanging the session. Pure ctypes -
+    never touches COM. IMPORTANT: dismisses ONLY while a COM call is in flight
+    (bridge busy); when SA is idle or driven by hand no window is touched
+    (construction dialogs, the save-on-exit prompt survive). 'stop' disarms for
+    the session - only needed if hand-work and a COM step overlap.
+    
+    Args: action: 'status' (default) | 'start' | 'stop'; interval_s: poll interval
+          (default 0.5 s); title_contains: filter.
+    
+    Returns {action, running, interval_s, auto, closed_total, last_closed?,
+             error?}."""
     action = (action or "status").lower()
     if action == "start":
         return {"action": action, **_watchdog_start(interval_s, title_contains)}
@@ -485,20 +449,14 @@ def sa_launch(
     connect_host: str = "",
 ) -> dict:
     """Start the SpatialAnalyzer GUI, optionally opening a project file.
-
-    If SA is already running, does nothing (reports already_running). After
-    launch, optionally connects the SDK bridge to it.
-
-    Args:
-        file_path: Optional path to a .sa project file to open on launch.
-        exe_path: Override the auto-discovered 'Spatial Analyzer.exe' path.
-        timeout: Seconds to wait for the GUI process to appear.
-        connect_host: If non-empty (e.g. 'localhost'), connect the bridge to
-                      SA after launch and return the connection result.
-
-    Returns:
-        {launched, already_running, appeared, exe, file, pid?, connected?, error?}
-    """
+    If SA is already running, does nothing (reports already_running). With
+    connect_host non-empty, connects the SDK bridge after launch.
+    
+    Args: file_path: project file to open on launch; exe_path: override the
+          auto-discovered 'Spatial Analyzer.exe'; timeout: seconds to wait for the
+          GUI process; connect_host: e.g. 'localhost'.
+    
+    Returns {launched, already_running, appeared, pid?, connected?, error?}."""
     res = sa_app.launch_sa(
         file_path=file_path or None,
         exe_path=exe_path or None,
@@ -525,24 +483,15 @@ def sa_ensure_running(
     host: str = "localhost",
     timeout: float = 60.0,
 ) -> dict:
-    """Make sure SA is running AND the SDK bridge is connected to it.
-
-    Order matters (see AGENTS.md): the SDK engine must NEVER be born before
-    the SA GUI's SDK listener is up - an early engine pops a modal
-    "NRK socketinterface 10061" error and then wedges. So: launch the GUI if
-    needed, wait for the listener to bind (only on a cold start), create the
-    bridge, then Connect() with fast retries.
-
-    When SA is already running this returns in milliseconds.
-
-    Args:
-        file_path: Optional .sa file to open if SA must be launched.
-        host: SA SDK host (default 'localhost').
-        timeout: Seconds to wait for the GUI process to appear.
-
-    Returns:
-        {running, launched, connected, host, error?}
-    """
+    """Make sure SA is running AND the SDK bridge is connected.
+    Order matters (AGENTS.md): the engine must never be born before SA's listener
+    is up - launch the GUI if needed, wait for the listener (cold start only),
+    create the bridge, Connect with retries. Milliseconds when SA already runs.
+    
+    Args: file_path: project file when SA must be launched; host: SDK host
+          ('localhost'); timeout: seconds to wait for the GUI window.
+    
+    Returns {running, launched, connected, host, error?}."""
     out: dict = {"running": False, "launched": False, "connected": False,
                  "host": host, "error": None}
     if sa_app.is_sa_running():
@@ -630,39 +579,20 @@ def _open_file_sdk(file_path: str, embedded: bool = False) -> dict:
 @mcp.tool()
 def sa_open_file(file_path: str, import_mode: bool = False,
                  embedded: bool = False) -> dict:
-    """Open a SpatialAnalyzer .xit exchange file in the connected SA project.
-
-    SA's native project/exchange format is .xit (a .xit carries a whole job:
-    collections, points, geometry, frames, instruments, even MP tasks - see
-    the Samples folder). Two MP steps drive file loading (confirmed against
-    the SA 2015 "MP Command Reference"):
-
-      * "Open SA File"  - DISCARDS the current job and opens the .xit. Arg
-        "SA File Name" (File Path or Embedded File Name).
-      * "Import SA File" - imports the .xit INTO the current job (merging
-        collections, renaming on collision). Args "SA File Name" plus a
-        Boolean "Allow Operator Selections" (True pops a picker; False
-        imports everything silently).
-
-    NOTE: opening always replaces the loaded job, so if the file is ALREADY
-    open this reloads it and discards unsaved in-memory state. For an
-    attach-first flow that reuses the already-open job instead, use
-    sa_ensure_file() - it detects the open copy (window caption / what this
-    session loaded) and skips the reload, force-restarting SA only if the
-    open cannot succeed.
-
-    Args:
-        file_path: Absolute path to the .xit file (or embedded-file name if
-                   `embedded`).
-        import_mode: False = replace the current job ("Open SA File", the
-                     default); True = merge into the current job
-                     ("Import SA File").
-        embedded: True when file_path is an embedded-file name, not a disk
-                  path.
-
-    Returns:
-        {opened, step, status_code, status, messages, error?}
-    """
+    """Open an SA .xit exchange file (SA's native job format) in the connected
+    project.
+    import_mode=False (default) = 'Open SA File': DISCARDS the loaded job and
+    loads the .xit. True = 'Import SA File': merges the .xit INTO the current job
+    (renames on collision, silent).
+    NOTE: a plain open always replaces the loaded job - re-opening an already-open
+    file discards unsaved in-memory state; for attach-first semantics use
+    sa_ensure_file().
+    
+    Args: file_path: absolute .xit path (or embedded-file name if embedded=True);
+          import_mode: False = replace / True = merge; embedded: file_path is an
+          embedded-file name.
+    
+    Returns {opened, step, status_code, status, messages, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -690,23 +620,13 @@ def sa_open_file(file_path: str, import_mode: bool = False,
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def sa_current_file() -> dict:
-    """Report which job file SA currently appears to have loaded.
-
-    SA 2015's SDK cannot say what file the GUI has open (no MP step, no COM
-    property), so this returns the evidence the attach-first open
-    (sa_ensure_file) uses:
-      - tracked_file: the job file THIS server process opened/launched last
-        (empty on a fresh process, e.g. a new MCP session);
-      - window_title: the SA main-window caption - if it carries a file name
-        (e.g. "... - job.xit"), it also reveals a job loaded by hand or by an
-        earlier MCP session;
-      - current_file: the best guess, if one can be derived.
-    COM-free (never creates the bridge), so it is safe to call anytime. Use it
-    before sa_ensure_file / sa_open_file when you need to know what is loaded.
-
-    Returns:
-        {tracked_file, tracked_how, window_title, current_file, error?}
-    """
+    """Report which job file SA appears to have loaded (SA 2015's SDK cannot tell).
+    Returns the evidence sa_ensure_file uses: tracked_file (what THIS server
+    session opened/launched last) and window_title (SA main-window caption -
+    catches a job loaded by hand or an earlier session), plus current_file: the
+    best guess. COM-free - safe anytime.
+    
+    Returns {tracked_file, tracked_how, window_title, current_file, error?}."""
     tpath, thow, _tat = _tracked_open()
     title = _sa_window_title()
     current = None
@@ -800,42 +720,24 @@ def sa_ensure_file(
     force_restart: bool = True,
     save_current: bool = True,
 ) -> dict:
-    """Make SA work on `file_path`, ATTACHING to an already-open copy.
-
-    Call this before acting on a job file. SA holds one job at a time, and its
-    'Open SA File' step DISCARDS whatever is loaded and reloads from disk -
-    re-opening a file that is already open would silently throw away unsaved
-    in-memory state (previous fits, manual GUI edits). SA 2015's SDK cannot
-    report which file the GUI has open, so this tool first checks the two
-    signals that do exist:
-      1. the file THIS server session loaded/launched (sa_open_file /
-         sa_ensure_running / sa_launch), and
-      2. the SA main-window caption (catches a job the user opened by hand or
-         an earlier MCP session left open).
-    If either says `file_path` is already the loaded job, nothing is reloaded
-    - the SDK bridge is simply connected and the live job is used
-    (already_open: True). Otherwise the file is opened normally, with the
-    current job saved first when its own file is known (`save_current`). If
-    the file cannot be attached or opened through the SDK at all (SA wedged,
-    listener dead, open step failed), it force-closes SA and relaunches it
-    with the file (`force_restart`) - the deterministic recovery; a restart
-    discards unsaved changes of the previous job, so enable it only when the
-    requested file must end up loaded.
-
-    Args:
-        file_path: Absolute path to the .xit file to work on.
-        host: SA SDK host (default 'localhost').
-        timeout: Seconds to wait for the GUI (launch path) / SDK connect.
-        force_restart: If True, when the SDK open fails, kill SA and relaunch
-                       it with the file (default True).
-        save_current: Save the current job first when its file is known
-                      (default True).
-
-    Returns:
-        {attached, already_open, opened, restarted, previous_job_saved,
-         evidence ({tracked_path, window_title, how}), step?, status?,
-         messages?, error?}
-    """
+    """Make SA work on file_path, ATTACHING to an already-open copy (no reload).
+    SA holds one job at a time and 'Open SA File' always reloads from disk, so
+    re-opening an already-open file would silently throw away unsaved in-memory
+    state (fits, manual edits). Since the SDK cannot report the loaded file, this
+    checks (1) what this server session loaded/launched and (2) the SA window
+    caption; if either says file_path is loaded, it attaches and reuses the live
+    job (already_open: True). Otherwise it saves the current job when its file is
+    known (save_current), then SDK-opens the file; if the open or the Connect
+    fails while SA is running (wedged listener), it force-closes SA and relaunches
+    it with the file (force_restart) - a restart discards the previous job's
+    unsaved changes.
+    
+    Args: file_path: absolute .xit path; host: SDK host ('localhost'); timeout:
+          seconds to wait; force_restart: default True; save_current: default
+          True.
+    
+    Returns {attached, already_open, opened, restarted, previous_job_saved,
+             evidence, step?, status?, error?}."""
     file_path = os.path.abspath(file_path)
     if not os.path.isfile(file_path):
         return {"attached": False, "already_open": False, "opened": False,
@@ -906,33 +808,18 @@ def sa_run_step(
     vector_args: dict | None = None,
     output_args: list[str] | None = None,
 ) -> dict:
-    """Execute an arbitrary SA "Measurement Plan step" by name.
-
-    Every SA operation (Construct Point, Construct Sphere, Make Transform,
-    reports, exports, ...) is a named step with typed arguments. This generic
-    tool drives ANY step, so the model can explore SA's full capability set
-    without a dedicated tool per step.
-
-    Pattern (matches the SA SDK):
-      1. SetStep(step_name)
-      2. set each input argument by name + type
-      3. ExecuteStep()
-      4. read requested output arguments back
-
-    Args:
-        step_name: Exact SA step name, e.g. "Construct a Point in Working
-                   Coordinates" (case/space sensitive - see SA's MP tree).
-        string_args: {arg_name: value} string inputs.
-        double_args: {arg_name: value} numeric inputs.
-        int_args: {arg_name: value} integer inputs.
-        bool_args: {arg_name: value} boolean inputs.
-        vector_args: {arg_name: [x, y, z]} 3D vector inputs.
-        output_args: list of argument names to read back after execution.
-                     Their type is auto-detected from the SA step definition.
-
-    Returns:
-        {executed, status_code, status, messages, outputs, error?}
-    """
+    """Execute an arbitrary SA 'Measurement Plan step' by name - the generic escape
+    hatch for steps without a dedicated tool (Construct Point, transforms,
+    reports, exports, ...).
+    Pattern: SetStep(step_name) -> set typed args by exact name -> ExecuteStep ->
+    read requested outputs. Step/arg names are case- and space-sensitive; copy
+    them from SA's MP tree or the SDK examples.
+    
+    Args: step_name: exact step name; string_args/double_args/int_args/bool_args:
+          {arg_name: value}; vector_args: {arg_name: [x, y, z]}; output_args:
+          argument names to read back (type auto-detected).
+    
+    Returns {executed, status_code, status, messages, outputs, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -1158,45 +1045,20 @@ def _set_query_input(arg_name, value):
 def sa_inspect_project(collection: str = "",
                        object_types: list[str] | None = None,
                        include_points: bool = False) -> dict:
-    """Enumerate the SA project tree using the SA 2015 step model.
-
-    IMPORTANT: SA 2015 has NO "Get the Names of all ..." steps (those names in
-    older docs do not exist in this build). Enumeration uses a two-step model
-    confirmed live against SA 2015 ("MP Command Reference"):
-
-      * collections (collection == ""): "Get Number of Collections"
-        (out "Total Count") + loop "Get i-th Collection Name" (in
-        "Collection Index", out "Resultant Name").
-      * objects grouped by type (collection set): "Make a Collection Object
-        Name Ref List - By Type" (in "Collection" + "Object Type" enum; out
-        "Resultant Collection Object Name List"). The Object Type enum is
-        routed through IDispatch::Invoke (sa_sdk.set_object_type_arg) - without
-        that it mangles the enum and SA pops an interactive picker that blocks
-        ExecuteStep forever. Each output element is ONE object, returned as its
-        full hierarchical name ("A::т контур"). NOTE: SA may list the SAME full
-        name under several types (in this project the point group "т контур"
-        also comes back as a Cylinder - SA reuses the group name for the
-        fitted geometry), so names are grouped per type as SA reports them.
-      * points in a point group (include_points): "Make a Point Name Ref List
-        From a Group" (in "Group Name", out "Resultant Point Name List").
-        Verified live: the step wants the group name WITHOUT its collection
-        prefix ("т контур", not "A::т контур"), and returns one element per
-        point ("::т контур::1" - relative, empty collection segment).
-
-    Args:
-        collection: If empty, list only the top-level collections. Otherwise
-                    enumerate the objects of this collection, grouped by type.
-        object_types: Which SA Object Type values to enumerate for the
-                      collection. Defaults to the most useful ones (Point Group,
-                      Vector Group, Frame and the geometry primitives).
-        include_points: If True (and collection is set), also list the points
-                        in each Point Group. Can be slow for large groups.
-
-    Returns:
-        With no collection: {collections: [...], errors: [...]}.
-        With a collection:  {collection, types: {ObjectType: [full name, ...]},
-                            points_by_group?, errors: [...]}.
-    """
+    """Enumerate the SA project tree.
+    collection == '': list top-level collections. collection set: list its objects
+    grouped by Object Type (Point Group, Vector Group, Frame, Cylinder, Plane,
+    Line, ...) as full hierarchical names ('A::т контур'). SA may list the same
+    name under several types (fit geometry keeps the group name) - correct, not a
+    duplicate. include_points: also list each point group's points
+    ('т контур::1'); slow for large groups.
+    
+    Args: collection: '' = collections only; object_types: which SA Object Types
+          to enumerate (default: the useful set); include_points: read the points
+          of each Point Group too.
+    
+    Returns: '' - {collections, errors}; set - {collection, types,
+             points_by_group?, errors}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -1352,44 +1214,30 @@ def _run_points_visibility(full_names, show):
 
 @mcp.tool()
 def sa_show_objects(objects: list[str], collection: str = "") -> dict:
-    """Show objects in SA's graphics window ('Show Objects').
-
-    Un-hides collection objects (point groups, frames, fitted geometry, ...)
-    that were previously hidden. Each entry may be a full hierarchical name as
-    returned by sa_inspect_project ("A::т контур"), or a simple name resolved
-    inside `collection` (pass the collection when the job has several).
-
-    Args:
-        objects: Object names to show.
-        collection: Collection the simple names belong to ("" = the names are
-                   already full, or belong to the current collection).
-
-    Returns:
-        {shown, step, objects (normalized full names), status_code, status,
-         messages, error?}
-    """
+    """Show (un-hide) collection objects in the graphics window ('Show Objects').
+    Names: full hierarchical as sa_inspect_project returns ('A::т контур'), or
+    simple names resolved in `collection`.
+    
+    Args: objects: names to show; collection: for simple names ('' = names already
+          full / current collection).
+    
+    Returns {shown, step, objects (normalized), status_code, status, messages,
+             error?}."""
     full = [_object_full_name(o, collection) for o in (objects or [])]
     return _run_objects_visibility(full, True)
 
 
 @mcp.tool()
 def sa_hide_objects(objects: list[str], collection: str = "") -> dict:
-    """Hide objects in SA's graphics window ('Hide Objects').
-
-    Hides collection objects (point groups, frames, fitted geometry, ...) so
-    they no longer appear in the graphical view. Each entry may be a full
-    hierarchical name as returned by sa_inspect_project ("A::т контур"), or a
-    simple name resolved inside `collection`.
-
-    Args:
-        objects: Object names to hide.
-        collection: Collection the simple names belong to ("" = the names are
-                   already full, or belong to the current collection).
-
-    Returns:
-        {hidden, step, objects (normalized full names), status_code, status,
-         messages, error?}
-    """
+    """Hide collection objects in the graphics window ('Hide Objects').
+    Names: full hierarchical as sa_inspect_project returns ('A::т контур'), or
+    simple names resolved in `collection`.
+    
+    Args: objects: names to hide; collection: for simple names ('' = names already
+          full / current collection).
+    
+    Returns {hidden, step, objects (normalized), status_code, status, messages,
+             error?}."""
     full = [_object_full_name(o, collection) for o in (objects or [])]
     return _run_objects_visibility(full, False)
 
@@ -1397,25 +1245,15 @@ def sa_hide_objects(objects: list[str], collection: str = "") -> dict:
 @mcp.tool()
 def sa_show_points(points: list[str], group: str = "",
                    collection: str = "") -> dict:
-    """Show points in SA's graphics window ('Show/Hide Points').
-
-    Un-hides individual points of a point group (the tree shows each point
-    separately; hiding a group hides its points, and showing any point of a
-    hidden group shows the group again). Each entry may be a full
-    "C::G::T" name ("A::т контур::1"), the group-relative shape
-    sa_inspect_project's include_points returns ("т контур::1"), or a bare
-    target ("1") resolved against (collection, group).
-
-    Args:
-        points: Point names to show.
-        group: Point group for bare target names (full or bare name).
-        collection: Collection for bare/relative names ("" = current
-                    collection).
-
-    Returns:
-        {shown, step, points (normalized full names), status_code, status,
-         messages, error?}
-    """
+    """Show (un-hide) individual points of a point group ('Show/Hide Points').
+    Names: full 'C::G::T' ('A::т контур::1'), group-relative ('т контур::1'), or
+    bare target ('1') resolved against (collection, group).
+    
+    Args: points; group: for bare targets; collection: for bare/relative names
+          ('' = current).
+    
+    Returns {shown, step, points (normalized), status_code, status, messages,
+             error?}."""
     full = [_point_full_name(p, group, collection) for p in (points or [])]
     return _run_points_visibility(full, True)
 
@@ -1423,24 +1261,15 @@ def sa_show_points(points: list[str], group: str = "",
 @mcp.tool()
 def sa_hide_points(points: list[str], group: str = "",
                    collection: str = "") -> dict:
-    """Hide points in SA's graphics window ('Show/Hide Points').
-
-    Hides individual points of a point group so they no longer appear in the
-    graphical view. Each entry may be a full "C::G::T" name
-    ("A::т контур::1"), the group-relative shape sa_inspect_project's
-    include_points returns ("т контур::1"), or a bare target ("1") resolved
-    against (collection, group).
-
-    Args:
-        points: Point names to hide.
-        group: Point group for bare target names (full or bare name).
-        collection: Collection for bare/relative names ("" = current
-                    collection).
-
-    Returns:
-        {hidden, step, points (normalized full names), status_code, status,
-         messages, error?}
-    """
+    """Hide individual points of a point group ('Show/Hide Points').
+    Names: full 'C::G::T' ('A::т контур::1'), group-relative ('т контур::1'), or
+    bare target ('1') resolved against (collection, group).
+    
+    Args: points; group: for bare targets; collection: for bare/relative names
+          ('' = current).
+    
+    Returns {hidden, step, points (normalized), status_code, status, messages,
+             error?}."""
     full = [_point_full_name(p, group, collection) for p in (points or [])]
     return _run_points_visibility(full, False)
 
@@ -1449,26 +1278,17 @@ def sa_hide_points(points: list[str], group: str = "",
 def sa_show_hide_by_type(object_type: str, visible: bool,
                          collection: str = "",
                          all_collections: bool = False) -> dict:
-    """Show or hide every object of one type ('Show/Hide by Object Type').
-
-    Bulk show/hide for an object type across a collection or the whole job,
-    e.g. hide all "Point Group" entries to declutter the view before a fit.
-    The Object Type enum is routed through IDispatch::Invoke, so the step runs
+    """Show or hide every object of one type at once ('Show/Hide by Object Type'),
+    e.g. hide all 'Point Group' entries to declutter the view before a fit. Runs
     non-interactively.
-
-    Args:
-        object_type: One of the SA object types ("Point Group", "Vector
-                     Group", "Frame", "Circle", "Cylinder", "Plane", "Sphere",
-                     "Cone", "Line", ... - "Any" matches every type).
-        visible: True = show, False = hide.
-        collection: Collection to scope to ("" = current collection). Ignored
-                   when all_collections is True.
-        all_collections: True = apply in every collection.
-
-    Returns:
-        {applied, object_type, visible, collection, all_collections, step,
-         status_code, status, messages, error?}
-    """
+    
+    Args: object_type: SA type ('Point Group', 'Vector Group', 'Frame', 'Circle',
+          'Cylinder', 'Plane', 'Sphere', 'Cone', 'Line', ...; 'Any' = all);
+          visible: True = show / False = hide; collection: scope ('' = current;
+          ignored when all_collections=True); all_collections: every collection.
+    
+    Returns {applied, object_type, visible, step, status_code, status, messages,
+             error?}."""
     res = {"applied": False, "object_type": object_type,
            "visible": bool(visible), "collection": collection,
            "all_collections": bool(all_collections),
@@ -1508,19 +1328,13 @@ def sa_show_hide_by_type(object_type: str, visible: bool,
 @mcp.tool()
 def sa_construct_point(group: str, name: str, x: float, y: float,
                        z: float) -> dict:
-    """Construct a point at working coordinates (x, y, z).
-
-    Convenience wrapper around the "Construct a Point in Working Coordinates"
-    SA step. Useful as a quick end-to-end test of the pipeline.
-
-    Args:
-        group: Point group name (created if missing).
-        name: Point target name.
-        x, y, z: Coordinates in the current working frame.
-
-    Returns:
-        {executed, status, group, name, error?}
-    """
+    """Construct a point at working coordinates (x, y, z) - a quick end-to-end
+    pipeline test ('Construct a Point in Working Coordinates').
+    
+    Args: group: point group name (created if missing); name: target name; x/y/z:
+          coordinates in the current working frame.
+    
+    Returns {executed, status, group, name, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -1746,32 +1560,20 @@ def sa_best_fit(
     collection: str = "",
     coordinates: list | None = None,
 ) -> dict:
-    """Construct a best-fit geometric primitive from points.
-
-    Point source (one of):
-      - point_group: name of an existing point group (in `collection`), or
-      - coordinates: list of [x, y, z] triples; a temporary point group is
-        built first, then the fit is computed from it.
-
-    geometry_type must be one of: plane, sphere, cylinder, cone, circle, line.
-
-    Confirmed against live SA 2015: the fit runs through the single MP step
-    "Fit Geometry to Point Group" (the older "Construct a Best Fit <Shape>"
-    step names do not exist in this build). Status DoneSuccess means the
-    object was created under object_name.
-
-    Args:
-        geometry_type: One of plane|sphere|cylinder|cone|circle|line.
-        object_name: Name for the constructed geometry object.
-        point_group: Existing point group to fit to (mutually exclusive with
-                     coordinates, but may be used as the temp group name).
-        collection: Collection holding the point group / output object.
-        coordinates: Optional list of [x, y, z] point coordinates.
-
-    Returns:
-        {constructed, geometry_type, object_name, step, status, parameters,
-         point_source, build?, messages, error?}
-    """
+    """Best-fit plane/sphere/cylinder/cone/circle/line from a point group or raw
+    coordinates.
+    Runs the single live-confirmed step 'Fit Geometry to Point Group' (the
+    'Construct a Best Fit <Shape>' names do not exist in SA 2015); DoneSuccess =
+    the object was created under object_name. The auto 'cardinal points' group
+    created by the fit profile is deleted afterwards (cardinal_points_removed).
+    
+    Args: geometry_type: plane|sphere|cylinder|cone|circle|line; object_name:
+          output geometry name; point_group: group to fit (or temp group when
+          coordinates given); collection: of group/output; coordinates:
+          [[x, y, z], ...] alternative source (a temp group is built).
+    
+    Returns {constructed, step, status, parameters, point_source,
+             cardinal_points_removed?, messages, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -2228,23 +2030,16 @@ def _quality_from_source(geometry_type, collection, object_name, group,
 @mcp.tool()
 def sa_geometry_props(geometry_type: str, object_name: str,
                       collection: str = "") -> dict:
-    """Read the parameters of an existing fitted geometry object.
-
-    The best-fit step itself returns no numbers ("Return Arguments: None"), so
-    the built geometry is read back with SA's 'Get <Type> Properties' step:
-    cylinder begin/end/axis/length/radius/diameter, sphere center/radius,
-    circle center/normal/radius, plane normal/point/D, line begin/end/length,
-    cone apex/axis/included angle. All lengths are in the job's distance unit.
-
-    Args:
-        geometry_type: One of plane|sphere|cylinder|cone|circle|line.
-        object_name: Name of the geometry object (as created by sa_best_fit).
-        collection: Collection holding the object ("" if none).
-
-    Returns:
-        {geometry_type, object_name, collection, step, status, properties,
-         error?}
-    """
+    """Read the parameters of an existing fitted geometry object (the fit step
+    returns no numbers) via 'Get <Type> Properties'.
+    Cylinder begin/end/axis/length/radius/diameter; plane normal/point/D; sphere
+    center/radius; circle center/normal/radius; cone apex/axis/length/angles; line
+    begin/end/length. Job distance units.
+    
+    Args: geometry_type: plane|sphere|cylinder|cone|circle|line; object_name:
+          geometry as created by sa_best_fit; collection: '' if none.
+    
+    Returns {step, status, properties, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -2269,41 +2064,22 @@ def sa_fit_quality(
     tolerance_mm: float | None = None,
     probe_offset_mm: float | None = None,
 ) -> dict:
-    """Check how well a fitted geometry matches its point group.
-
-    Computes the signed deviation of every group point from the fitted
-    primitive and reports the fit quality: RMS deviation ("СКО"), mean,
-    sigma, min/max signed deviation, max absolute deviation - plus, when
-    tolerance_mm is given, how many points are out of tolerance ("вылеты")
-    with their names and deviations.
-
-    Reflector compensation: SA measures to the reflector centre and stores the
-    offset per point ('Get Point Properties' -> Radial Offset), applying it
-    during the fit - so raw point coordinates sit one reflector radius outside
-    the fitted surface. Deviations are reduced by the stored per-point radial
-    offset automatically; when the group stores none (or you evaluate your own
-    coordinates), pass the constant offset as probe_offset_mm (e.g. 19.05 for
-    a 3/4" SMR). What "compensation" did is reported in the response.
-
-    Deviation sign convention: + = point outside the nominal surface
-    (cylinder/sphere/circle radial, plane along its normal), - = inside; a
-    line has no meaningful sign (magnitude only). All values are in the job's
-    distance unit (mm in the test file).
-
-    Args:
-        geometry_type: One of plane|sphere|cylinder|cone|circle|line.
-        object_name: Fitted geometry to check (created by sa_best_fit).
-        point_group: Point group the geometry was fit from.
-        collection: Collection holding both ("" if none).
-        tolerance_mm: Optional tolerance; points with |deviation| above it are
-                      reported as outliers.
-        probe_offset_mm: Constant reflector offset to compensate when the
-                         points store none (default: use stored offsets).
-
-    Returns:
-        {ok, geometry_type, object_name, geometry, stats, outliers,
-         compensation, error?}
-    """
+    """Check how well a fitted geometry matches its point group: signed deviation of
+    every point + stats (RMS 'СКО', mean, sigma, min/max) + outliers beyond
+    tolerance_mm. Sign: + = outside the nominal surface (radial for cylinder/
+    sphere/circle, normal for plane), - = inside; a line has magnitude only.
+    Reflector compensation: SA measures to the reflector centre (stored per point,
+    'Get Point Properties' -> Radial Offset), so raw points sit ~one reflector
+    radius off the surface. Deviations are compensated by the stored per-point
+    offset automatically; pass probe_offset_mm (e.g. 19.05 for a 3/4" SMR) when
+    the group stores none. `compensation` reports what ran.
+    
+    Args: geometry_type: plane|sphere|cylinder|cone|circle|line; object_name:
+          fitted geometry; point_group: group it was fit from; collection: '' if
+          none; tolerance_mm: |deviation| above it = outlier; probe_offset_mm:
+          constant offset when points store none.
+    
+    Returns {ok, geometry, stats, outliers, compensation, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -2330,30 +2106,17 @@ def sa_best_fit_report(
     tolerance_mm: float | None = None,
     probe_offset_mm: float | None = None,
 ) -> dict:
-    """Best-fit geometry AND report the construction results.
-
-    One call for: fit the primitive ("Fit Geometry to Point Group"), read its
-    parameters back ("Get <Type> Properties") and evaluate how well it was
-    built (RMS/СКО, mean, sigma, min/max, outliers vs tolerance_mm). Same
-    point sources as sa_best_fit: existing point_group, or raw coordinates.
-    Reflector compensation follows sa_fit_quality (stored point offsets, or
-    the constant probe_offset_mm).
-
-    Args:
-        geometry_type: One of plane|sphere|cylinder|cone|circle|line.
-        object_name: Name for the constructed geometry object.
-        point_group: Existing point group to fit to (or temp group name when
-                     coordinates are given).
-        collection: Collection holding the group / output object.
-        coordinates: Optional list of [x, y, z] point coordinates.
-        tolerance_mm: Optional tolerance; points with |deviation| above it are
-                      listed as outliers ("вылеты").
-        probe_offset_mm: Constant reflector offset to compensate when the
-                         points store none.
-
-    Returns:
-        sa_best_fit result plus {geometry, stats, outliers, compensation}.
-    """
+    """Best-fit geometry AND report the construction in one call: fit -> read
+    parameters back -> fit quality (RMS/СКО, sigma, min/max, outliers vs
+    tolerance_mm). Point sources and reflector compensation as in sa_best_fit /
+    sa_fit_quality.
+    
+    Args: geometry_type: plane|sphere|cylinder|cone|circle|line; object_name;
+          point_group; collection; coordinates: [[x, y, z], ...]; tolerance_mm:
+          outlier threshold; probe_offset_mm: constant offset when points store
+          none.
+    
+    Returns the fit result plus {geometry, stats, outliers, compensation}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -2397,74 +2160,33 @@ def sa_fit_clean(
     delete_outliers: bool = False,
     probe_offset_mm: float | None = None,
 ) -> dict:
-    """Robust best fit: iteratively exclude ("delete") outliers and refit.
-
-    Replicates the SA GUI robust best-fit: fit the primitive to the point
-    group, measure every point's deviation, then refit to ONLY the points
-    within tolerance ('Fit Geometry to Points' over the kept subset), repeat
-    until no outliers remain or the excluded set stops changing between
-    passes (a genuinely out-of-tolerance population never reaches zero
-    outliers - the robust fit stabilises instead), or max_iterations is
-    reached. Points farther than the tolerance never influence the geometry
-    and stay in the group. Reports RMS ("СКО"), sigma and the excluded count
-    of every iteration; 'stats' covers all group points, 'stats_kept' only
-    the in-tolerance points the geometry was fit to.
-
-    Note: SA's own 'Fit Geometry to Point Group' does NOT exclude when
-    'Ignore Out of Tolerance Points' is set (confirmed live on SA 2015: it
-    returns DoneMinorError "tolerance exceeded" but the geometry is identical
-    to an unconstrained fit) - exclusion is done here explicitly, pass by
-    pass, through the list variant of the fit step.
-
-    Note: SA never OVERWRITES a constructed object when the name already
-    exists - a second fit under the same name creates a suffixed duplicate
-    ("X", then "X1"; confirmed live on SA 2015), so reading the geometry back
-    under the plain name would return the FIRST pass' stale result.
-    sa_fit_clean therefore deletes any pre-existing object named object_name
-    before starting and deletes its own previous-pass object before every
-    refit ('Delete Objects', joined full name - confirmed live): the job ends
-    up with exactly one geometry object, named object_name.
-
-    Threshold: tolerance_mm (fixed, physical) when given, otherwise a
-    sigma-clip of sigma * robust_sigma, where robust_sigma is 1.4826 * MAD of
-    the deviations (a few genuine outliers inflate the plain standard
-    deviation so much that sigma * std excludes nothing - seen live). Falls
-    back to the median |deviation| (then the plain standard deviation) when
-    MAD is zero. Both modes measure around the fit's MEDIAN deviation, and a
-    first pass whose median sits far from zero (a strong outlier pulled the
-    LSQ geometry, so every good point reads out-of-tolerance on the wrong
-    side) gets one automatic 'debias' pass first - such iterations are marked
-    debias_pass=True. A run whose excluded set keeps changing until
-    max_iterations (a genuine form deviation larger than the tolerance, e.g.
-    tolerance 0.2 on a surface with ~0.66 RMS form error) returns converged
-    False with the best (tightest-core) geometry; delete_outliers still
-    deletes against that final geometry, exactly like the SA GUI 'Delete
-    Outliers' action.
-    Deviations are reflector-compensated like in sa_fit_quality (stored point
-    offsets, or the constant probe_offset_mm); lengths are in the job's unit.
-
-    WARNING: delete_outliers=True additionally PHYSICALLY deletes the outlier
-    points from the point group ('Delete Points') after convergence and refits
-    on the remaining points - destructive to the group in the current job.
-
-    Args:
-        geometry_type: One of plane|sphere|cylinder|cone|circle|line.
-        object_name: Name for the constructed geometry object. A pre-existing
-                     object with this same name is deleted first (replaced).
-        point_group: Point group to fit.
-        collection: Collection holding both ("" if none).
-        tolerance_mm: Fixed tolerance for outlier exclusion (job length unit).
-        sigma: Sigma multiplier for automatic threshold when tolerance_mm is
-               None (default 3.0; <=0 disables exclusion).
-        max_iterations: Max fit passes (default 6).
-        delete_outliers: Also physically delete outliers from the group.
-        probe_offset_mm: Constant reflector offset to compensate when the
-                         points store none.
-
-    Returns:
-        {constructed, object_name, iterations: [...], converged, geometry,
-         stats, outliers, error?}
-    """
+    """Robust best fit: iteratively exclude out-of-tolerance points and refit (the
+    SA GUI robust fit as explicit passes).
+    fit -> read geometry -> compensated deviations -> refit ONLY the in-threshold
+    points ('Fit Geometry to Points') -> repeat until no outliers / the excluded
+    set stops changing / max_iterations. SA's own 'Ignore Out of Tolerance Points'
+    does NOT exclude (live-confirmed) - exclusion is done here, pass by pass. SA
+    never overwrites: same-named and previous-pass objects are deleted before each
+    refit, so the job ends with exactly one geometry under object_name
+    (replaced_object). Each iteration reports RMS over ALL points and the kept
+    core (stats_kept).
+    Threshold: fixed tolerance_mm, else sigma x robust spread 1.4826 * MAD (plain
+    sigma excludes nothing when outliers inflate it); deviations are measured
+    around the fit's MEDIAN with an automatic debias pass when the median sits far
+    from zero (debias_pass). If the excluded set churns to max_iterations (genuine
+    form error > tolerance, e.g. 0.2 mm on a ~0.66 mm RMS form) -> converged:
+    False with the tightest-core geometry - honest output, not a bug.
+    WARNING delete_outliers=True PHYSICALLY deletes the outliers ('Delete Points')
+    after convergence and refits - destructive to the current job.
+    
+    Args: geometry_type: plane|sphere|cylinder|cone|circle|line; object_name;
+          point_group; collection; tolerance_mm: fixed threshold (job units);
+          sigma: multiplier when tolerance_mm is None (default 3.0; <=0 off);
+          max_iterations: default 6; delete_outliers: physical delete;
+          probe_offset_mm: constant offset when points store none.
+    
+    Returns {constructed, iterations, converged, geometry, stats, outliers,
+             replaced_object?, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -3031,43 +2753,26 @@ def sa_fit_fixed(
     tolerance_mm: float | None = None,
     include_deviations: bool = False,
 ) -> dict:
-    """Best fit with a FIXED parameter, plus reflector-offset compensation side.
-
-    SA 2015 has no fit step that constrains the radius / cone angle, so the
-    primitive is fitted here by least squares (sa_fitmath) and then created in
-    SA via its Construct step - the resulting object carries exactly the fixed
-    radius / included angle.
-
-    Fixed parameters (one set per geometry_type):
-      cylinder | circle | sphere: radius_mm or diameter_mm (the nominal value
-        in the job length unit). If neither is given the radius is left free.
-      cone: apex_angle_deg - full cone apex angle ("угол раствора", 0..180).
-
-    compensation ("в какую сторону компенсировать смещение отражателя"):
-      The measured points are reflector/target centre coordinates, standing one
-      probe radius off the true surface. Offset magnitudes come from the
-      group's stored Radial Offset point properties, else probe_offset_mm.
-        - "outside" (+): 3D - reflector on the OUTSIDE (shaft / outer surface);
-                         2D - above the surface.
-        - "inside" (-):  3D - reflector on the INSIDE (bore); 2D - below.
-        - "none":        no compensation (fit the raw centres).
-        - "both":        circle only - each point is compensated by its own
-                         stored offset sign (a measured circle can have points
-                         standing on both sides of the surface).
-      With no stored offsets and no probe_offset_mm, compensation is a no-op
-      (a note is returned) - the fit degenerates to the raw centres.
-
-    Point source: point_group (an existing group, keeps per-point stored
-    offsets) or coordinates ([[x,y,z],...]; offsets then come from
-    probe_offset_mm only). A pre-existing object with object_name is deleted
-    first (SA never overwrites - it would create a suffixed duplicate).
-
-    Returns a flat dict: ok, constructed, geometry_type, object_name,
-    collection, point_count, the read-back parameters (begin/end/axis/radius/
-    ... per type), stats (RMS "СКО" of the compensated deviations, average,
-    standard deviation, min/max), optional outliers_over_mm, deviations,
-    fit info, error?
-    """
+    """Best fit with a FIXED parameter + reflector compensation side. No SA step
+    constrains a parameter, so the fit runs offline (sa_fitmath) and the object is
+    then CREATED in SA via Construct <Type> - it carries exactly the fixed nominal.
+    Fixed per type: cylinder/sphere/circle -> radius_mm or diameter_mm (neither =
+    free radius); cone -> apex_angle_deg (full 'угол раствора', 0..180).
+    compensation (offset magnitudes from the stored Radial Offset properties,
+    else probe_offset_mm): 'outside' (+) reflector on the outside (shaft / outer
+    surface); 'inside' (-) inside (bore); 'none' no compensation (raw centres);
+    'both' (circle only) each point by its own stored-offset sign.
+    KEY: with stored offsets the free-fit radius Rf is the reflector-CENTRE
+    radius - pass the TRUE-surface radius (~ Rf minus/plus the offset); the side
+    picks the sign. No offsets at all => compensation is a no-op (note returned).
+    
+    Args: geometry_type: cylinder|sphere|circle|cone; object_name; radius_mm /
+          diameter_mm / apex_angle_deg; compensation: outside|inside|none|both;
+          point_group or coordinates: source; collection; probe_offset_mm;
+          tolerance_mm: optional outlier threshold; include_deviations.
+    
+    Returns {ok, constructed, point_count, parameters (read back), stats,
+             deviations?, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -3333,77 +3038,31 @@ def sa_project_points(
     rms_tolerance: float = 0.0,
     max_abs_tolerance: float = 0.0,
 ) -> dict:
-    """Project points onto object(s) at their closest point (new point group).
-
-    Mirrors SA's Construct > Points > Project Points to > Objects > Closest
-    Point: every source point (whole point groups and/or individual points) is
-    projected onto the nearest point of the target object(s) and written to a
-    NEW point group. Under the hood SA 2015 runs the 'Query Points to Objects'
-    step with Projection Options output "Points on Object" - the query
-    engine's "creates projected points on the object" mode - with 'Show
-    Results Dialog?' False.
-
-    Live-verified geometry on SA 2015: projected points land exactly ON the
-    object (plane z=25 -> z~0; cylinder r=430 -> r=r_fit to 1e-9). The step
-    status is NOT a reliable success signal: SA 2015 can return
-    DoneFatalError (code 3) while still creating the points (flaky, seen with
-    identical inputs across sessions), and it silently SKIPS points it cannot
-    project. projected/result_count are therefore decided by what the result
-    group actually contains, with status_code/status kept for reference.
-
-    Args:
-        objects: Target objects to project onto (plane, cylinder, sphere,
-                 circle, ...). Names may be full "C::O" or simple (resolved
-                 inside `collection`). With several objects every point lands
-                 on the nearest object among them.
-        point_groups: Point groups whose points are all projected
-                      (full "C::G" or simple name in `collection`).
-        points: Individual points to project, as full "C::G::T" or
-                group-relative "G::T" names (bare targets resolve against
-                `group`). At least one of point_groups/points is required.
-        group: Point group hint for bare target names in `points`.
-        result_group: Name of the NEW point group holding the projected points
-                      (GUI Point Naming dialog). A pre-existing group with
-                      this name is deleted first and reported under
-                      `replaced` (SA never overwrites - it would merge).
-                      Default: "<group>_proj" when a single group was given.
-        collection: Collection for simple object/group names and the result
-                    group ("" = current collection).
-        projection_type: Query projection output. Default "Points on Object"
-                         = projected closest points ON the object. Other SA
-                         values: "Points on Offset Object" (points backed off
-                         the surface by probe_offset_mm along the surface
-                         normal - the GUI Probe Offset semantics),
-                         "Points on Probe Surface", and the vector outputs
-                         "Offset Object To Target Vectors",
-                         "Target To Offset Object Vectors",
-                         "Object To Probe Vectors", "Probe To Object Vectors".
-        ignore_edge_projections: Drop points whose projection would land on an
-                                 object edge (surface boundary).
-        use_stored_offsets: True = let SA apply each source point's stored
-                            probe/reflector offset (measured-surface
-                            semantics). Default False = project the raw
-                            coordinates with the stored offsets ignored
-                            (deterministic; avoids SA 2015 fatals on groups
-                            that carry stored offsets). Either way the created
-                            points land on the object.
-        probe_offset_mm: Back-away distance from the surface (GUI Probe Offset
-                         dialog; positive = along the outward surface normal).
-                         Note: with projection_type "Points on Object" SA 2015
-                         ignores this value (verified - points always land ON
-                         the object); use "Points on Offset Object" to create
-                         backed-off points.
-        extra_material_mm: Virtual material thickness added to the target
-                           objects before projecting. Observed no effect with
-                           "Points on Object" on SA 2015 (it matters for the
-                           offset/vector outputs).
-        rms_tolerance, max_abs_tolerance: Query tolerances (0.0 = none).
-
-    Returns:
-        {projected, step, status_code, status, messages, outputs,
-         projection_type, source, result_group, result_count, requested,
-         skipped, skipped_points, replaced, error?}
-    """
+    """Project points onto object(s) at their closest point -> NEW point group (SA
+    'Query Points to Objects', output 'Points on Object').
+    Every source point (whole groups and/or individual points) lands exactly ON
+    the object (live-verified on SA 2015). The step status is NOT a reliable
+    signal - SA can return code 3 while STILL creating the points and silently
+    skips unprojectable ones: success is decided by what the result group actually
+    contains (result_count), status is advisory, missing targets are listed
+    (skipped_points). A same-named result group is deleted first (SA never
+    overwrites), reported under `replaced`.
+    projection_type: 'Points on Object' (default - probe_offset_mm and
+    extra_material_mm are IGNORED here, verified), 'Points on Offset Object'
+    (points backed off by probe_offset_mm along the outward normal - the GUI
+    Probe Offset), 'Points on Probe Surface', or the vector outputs ('Object To
+    Probe Vectors', ...). use_stored_offsets=False (default) zeroes stored
+    probe/reflector offsets and projects raw coordinates (deterministic - avoids
+    SA 2015 fatals on offset-carrying groups); True lets SA apply them. Either way
+    points land ON the object; created points' offsets read back as 0.
+    
+    Args: objects: targets (full/simple); point_groups and/or points: sources
+          (any name form); result_group: default '<group>_proj'; collection;
+          ignore_edge_projections; probe_offset_mm; extra_material_mm;
+          rms_tolerance / max_abs_tolerance: 0.0 = none.
+    
+    Returns {projected, result_group, result_count, requested, skipped_points,
+             replaced, status_code, status, error?}."""
     res = {
         "projected": False,
         "step": _PROJECT_QUERY_STEP,
@@ -3695,67 +3354,25 @@ def sa_compare_points_objects(
     rms_tolerance: float = 0.0,
     max_abs_tolerance: float = 0.0,
 ) -> dict:
-    """Create a VECTOR GROUP of deviations: measured points vs objects.
-
-    Mirrors SA's GUI Compare > Points > Objects ("Сравнить > Точки >
-    Объекты"): each source point (whole point groups and/or individual
-    points) is compared to the closest of the target objects (primitives and
-    surfaces) and the deviations are written to a NEW vector group - one
-    whisker per point, the primary graphical way SA shows deviations. Under
-    the hood SA 2015 runs the same 'Query Points to Objects' step as
-    sa_project_points but with a Projection Options *vector* output.
-
-    Vectors automatically account for the per-point stored target/reflector
-    offset unless use_stored_offsets=False (SA User Manual ch. 20: "All
-    query commands automatically account for target offset unless otherwise
-    noted").
-
-    Args:
-        objects: Target objects to compare to (plane, cylinder, sphere,
-                 circle, surface, ...). Full "C::O" or simple name (resolved
-                 inside `collection`). Each point queries the nearest object.
-        point_groups: Point groups whose points are all compared (full
-                      "C::G" or simple name in `collection`).
-        points: Individual points to compare (full "C::G::T", group-relative
-                "G::T", or bare target against `group`). At least one of
-                point_groups/points is required.
-        group: Point group hint for bare target names in `points`.
-        result_group: Name of the NEW vector group with the deviation arrows.
-                      Default: "<group>_dev" for a single source group. A
-                      pre-existing vector group with this name is deleted
-                      first and reported under `replaced` (SA never
-                      overwrites - it would create a suffixed duplicate).
-        collection: Collection holding points, objects and the result ("" =
-                    current collection).
-        projection_type: Direction of the whiskers (the GUI Projection
-                         Options). Default "Object To Probe Vectors" = the
-                         GUI "Offset Probe / inspect" default: arrows from
-                         the object to the measured point (how far the point
-                         is from nominal). "Probe To Object Vectors" is the
-                         reversed "build" view (same magnitudes). The
-                         "Offset Surface" pair is "Target To Offset Object
-                         Vectors" / "Offset Object To Target Vectors"
-                         (vectors anchored at the point centre with all
-                         offsets applied on the object - for thin parts).
-        ignore_edge_projections: Drop points whose projection lands on an
-                                 object edge.
-        use_stored_offsets: True = let SA apply each point's stored
-                            probe/reflector offset (measured-surface
-                            semantics, like the GUI). False = compare the raw
-                            coordinates (deterministic; avoids SA 2015 fatals
-                            on groups that carry stored offsets - see
-                            sa_project_points).
-        probe_offset_mm: Extra constant offset applied at the probe when
-                         overriding/storing is off; 0.0 = none.
-        extra_material_mm: Virtual material thickness added to the objects
-                           before comparing (0.0 = none).
-        rms_tolerance, max_abs_tolerance: Query tolerances (0.0 = none).
-
-    Returns:
-        {created, vector_group, vector_count, properties, step, status_code,
-         status, messages, outputs, projection_type, source, result_group,
-         requested, skipped, replaced, error?}
-    """
+    """Compare measured points to the closest of one or more objects -> NEW VECTOR
+    GROUP of deviation whiskers (GUI Compare > Points > Objects / 'Сравнить >
+    Точки > Объекты'). Same 'Query Points to Objects' engine as sa_project_points
+    with a vector output.
+    Direction (projection_type): 'Object To Probe Vectors' (default - arrow from
+    the object to the measured point, how far off nominal), 'Probe To Object
+    Vectors' (reversed, same magnitudes), 'Target To Offset Object Vectors' /
+    'Offset Object To Target Vectors' (offset-surface pair for thin parts).
+    Stored per-point probe/reflector offsets are applied by default
+    (use_stored_offsets=True - SA query commands account for target offset);
+    False compares raw coordinates. Same flaky-status caveat as sa_project_points:
+    success = what the created vector group contains; skipped points reported.
+    
+    Args: objects: targets; point_groups and/or points: sources (any name form);
+          result_group: default '<group>_dev'; collection; ignore_edge_projections;
+          probe_offset_mm; extra_material_mm; rms_tolerance / max_abs_tolerance.
+    
+    Returns {created, vector_group, vector_count, properties, requested, skipped,
+             replaced, status_code, status, error?}."""
     res = {
         "created": False,
         "vector_group": None,
@@ -3886,40 +3503,21 @@ def _vg_name_parts(full_name):
 def sa_vector_group_props(vector_group: str, collection: str = "",
                           include_vectors: bool = False,
                           max_vectors: int = 200) -> dict:
-    """Statistics + optional per-vector data of one vector group.
-
-    Wraps 'Get Vector Group Properties' (counts, tolerances, magnitudes) and
-    - when include_vectors=True - dumps each vector via
-    'Get i-th Vector From Vector Group' (name, begin/end/delta/ijk in
-    working coordinates, magnitude). Everything a vector group "knows" that
-    you can read back:
-
-      total_vectors, vectors_in_tolerance, vectors_out_of_tolerance,
-      pct_vectors_in_tolerance, pct_vectors_out_of_tolerance,
-      absolute_max_magnitude, absolute_min_magnitude, max_magnitude,
-      min_magnitude, standard_deviation, standard_deviation_mean_zero,
-      average_magnitude, avg_abs_magnitude, high_tolerance_value,
-      low_tolerance_value.
-
-    The HIGH/LOW TOLERANCE here are the same values the colorization uses
-    (in/out-of-tolerance counts) - set them with sa_vector_group_style.
-    Graphical parameters (arrowheads, magnification, tubes/blotches, colour
-    bar, colour range...) live in the colorization options; they are NOT
-    readable through the SDK (SA exposes no getter for the options object)
-    but are written by sa_vector_group_style.
-
-    Args:
-        vector_group: Full "C::VG" or simple name (in `collection`).
-        collection: Collection holding the group ("" = current collection).
-        include_vectors: Also dump the individual vectors (one entry per
-                         vector: name, begin, end, delta, ijk, magnitude).
-        max_vectors: Cap on the per-vector dump (0 = no cap). The response
-                     reports `truncated` when the group is larger.
-
-    Returns:
-        {ok, vector_group, collection, properties, vector_count,
-         vectors (when include_vectors), truncated, error?}
-    """
+    """Statistics (+ optional per-vector dump) of one vector group ('Get Vector
+    Group Properties'): total_vectors, in/out-of-tolerance counts + %, absolute
+    max/min and max/min magnitudes, std deviation, average magnitude, high/low
+    tolerance values. The in/out-of-tolerance counts are computed against the
+    high/low tolerance set by sa_vector_group_style.
+    include_vectors=True also dumps each whisker via 'Get i-th Vector From Vector
+    Group' (name, begin/end/delta/ijk in working coordinates, magnitude;
+    max_vectors caps it, `truncated` when larger). Graphical options are NOT
+    SDK-readable - only written by sa_vector_group_style.
+    
+    Args: vector_group: full 'C::VG' or simple (in collection); collection: '' =
+          current; include_vectors: dump individual vectors; max_vectors: cap
+          (0 = none).
+    
+    Returns {ok, properties, vector_count, vectors?, truncated, error?}."""
     res = {"ok": False, "vector_group": vector_group,
            "collection": collection, "properties": {}, "vector_count": None,
            "error": None}
@@ -3981,57 +3579,28 @@ def sa_vector_group_style(
     high_tolerance: float = 0.0,
     low_tolerance: float = 0.0,
 ) -> dict:
-    """Style one or more vector groups (arrows, colours, tolerances, bar).
-
-    Wraps the SA 2015 colorization steps (MP Command Reference p. 362-365) -
-    'Set Vector Group Colorization Options (Selected)' or, with
-    auto_range=True, 'Auto-Range and Set Vector Group Colorization
-    (Selected)' (saturation limits computed from the data instead of given).
-    Every display/colour parameter of the GUI "Vector Group Properties"
-    dialog is exposed:
-
-      Display:    draw_arrowheads, draw_tubes, draw_blotches (arrows vs
-                  tubes vs blotches), indicate_values (label each vector
-                  with its magnitude), vector_magnification (graphical
-                  scale of the whiskers), vector_width (px), blotch_size
-                  (job units), show_out_of_tolerance_only, color bar:
-                  show_color_bar_in_view / _percentages / _fractions.
-      Colour:     color_range_method ("Go/No-Go", "Reverse Go/No-Go",
-                  "Continuous", "Continuous (Entire Range)", "4 Color
-                  Go/No-Go", ... - the five presets of the GUI), base
-                  high/mid/low colours, high/low saturation limits
-                  (auto_range computes them from the group data),
-                  high_tolerance / low_tolerance (feed the in/out-of-tol
-                  statistics read by sa_vector_group_props).
-
-    The SDK sets the WHOLE options object at once - every field you omit
-    takes the default above (there is no getter to read current options, so
-    partial updates are not possible). With auto_range=True only the colour
-    mode matters; the saturation limits are taken from the data, and
-    treat_individually=True ranges each group on its own max/min instead of
-    the whole selection.
-
-    Args:
-        vector_groups: One or more vector groups to style (full "C::VG" or
-                       simple names in `collection`).
-        collection: Collection the simple names live in ("" = current).
-        auto_range: Compute high/low saturation limits from the data instead
-                    of using the given *_saturation_limit values.
-        treat_individually: With auto_range, range each group separately
-                            (False = one shared range for the selection).
-        color_range_method / base_*_color: Colour scheme strings. NOTE: the
-                    exact SA enum spellings are taken from the SA docs/GUI
-                    presets and have NOT been verified live yet - if a step
-                    rejects a spelling, pass another (the known preset list
-                    above) and check the `status` in the response.
-        high_tolerance / low_tolerance: Tolerance band (job units); the
-                    in/out-of-tolerance vector counts of sa_vector_group_props
-                    are computed against it. 0.0 = no tolerance.
-
-    Returns:
-        {applied, step, status_code, status, messages, vector_groups,
-         auto_range, options, error?}
-    """
+    """Style one or more vector groups - arrows/colours/tolerance band/colour bar
+    ('Set Vector Group Colorization Options (Selected)' or, with auto_range=True,
+    'Auto-Range and Set Vector Group Colorization (Selected)': saturation limits
+    computed from the data).
+    Display: draw_arrowheads / draw_tubes / draw_blotches, indicate_values
+    (magnitude labels), vector_magnification, vector_width, blotch_size,
+    show_out_of_tolerance_only, colour-bar flags (show_color_bar_in_view /
+    _percentages / _fractions). Colour: color_range_method ('Go/No-Go', 'Reverse
+    Go/No-Go', 'Continuous', 'Continuous (Entire Range)', '4 Color Go/No-Go',
+    ...), base_high/mid/low_color, high/low saturation limits, high_tolerance /
+    low_tolerance (the band behind sa_vector_group_props' in/out stats; 0.0 =
+    none).
+    NOTE: sets the WHOLE options object at once - omitted fields take their
+    defaults (no getter exists, so no partial updates). The color_range_method /
+    colour enum spellings are from the SA docs/GUI and NOT live-verified - if a
+    step rejects one, pass another known preset and check `status`.
+    
+    Args: vector_groups: one or more (full/simple, in collection); collection:
+          '' = current; auto_range; treat_individually: range each group on its
+          own; + the display/colour parameters above (as named).
+    
+    Returns {applied, step, status_code, status, messages, error?}."""
     res = {"applied": False, "step": None, "status": None,
            "status_code": None, "messages": [], "error": None,
            "vector_groups": [], "auto_range": bool(auto_range),
@@ -4277,41 +3846,21 @@ def sa_best_fit_from_points(
     tolerance_mm: float | None = None,
     probe_offset_mm: float | None = None,
 ) -> dict:
-    """Construct a best-fit primitive from an EXPLICIT list of points.
-
-    The point source is individual points, not a whole group: 'Fit Geometry
-    to Points' fits exactly the named points wherever they live - a subset of
-    one point group, or points spread across several groups and collections.
-    Each entry may be a full "C::G::T" name, a group-relative "G::T" name
-    (resolved inside `collection`), or a bare target name (resolved against
-    `group`). Every point keeps its stored reflector offset during the fit.
-
-    geometry_type must be one of: plane, sphere, cylinder, cone, circle, line.
-    Minimum point counts: line 2, plane/circle 3, sphere 4, cylinder 5,
-    cone 6. Points whose coordinates cannot be read are dropped and listed
-    under `unresolved`.
-
-    SA never overwrites a constructed object name (it creates a suffixed
-    duplicate), so a pre-existing object named object_name is deleted first
-    and reported under `replaced_object`.
-
-    Args:
-        geometry_type: One of plane|sphere|cylinder|cone|circle|line.
-        object_name: Name for the constructed geometry object.
-        points: The points to fit (full/relative/bare names, any groups).
-        group: Point group hint for bare target names in `points`.
-        collection: Collection for simple names and the output object ("" if
-                    none / current collection).
-        tolerance_mm: Optional tolerance; points with |deviation| above it are
-                      listed as outliers ("вылеты").
-        probe_offset_mm: Constant reflector offset to compensate when the
-                         points store none.
-
-    Returns:
-        {constructed, geometry_type, object_name, step, status, parameters,
-         geometry, stats, outliers, compensation, point_source,
-         replaced_object, error?}
-    """
+    """Best-fit primitive from an EXPLICIT list of points ('Fit Geometry to
+    Points') - fits exactly the named points wherever they live (a subset of one
+    group, or points across groups/collections); each keeps its stored reflector
+    offset.
+    Names: full 'C::G::T', group-relative 'G::T' (in collection), or bare (with
+    group). Min counts: line 2, plane/circle 3, sphere 4, cylinder 5, cone 6.
+    Unreadable points are dropped (unresolved). A same-named object is deleted
+    first (replaced_object - SA never overwrites).
+    
+    Args: geometry_type: plane|sphere|cylinder|cone|circle|line; object_name;
+          points; group: hint for bare names; collection; tolerance_mm: outlier
+          threshold; probe_offset_mm: constant offset when points store none.
+    
+    Returns {constructed, step, status, parameters, geometry, stats, outliers,
+             compensation, point_source, replaced_object, error?}."""
     gtype = geometry_type.lower()
     if gtype not in BESTFIT_TYPES:
         return {"constructed": False, "error": (
@@ -4676,36 +4225,22 @@ def sa_identify_geometry(
     points: list[str] | None = None,
     group: str = "",
 ) -> dict:
-    """Identify the geometric shape a point cloud was measured from.
-
-    Fits every candidate primitive to the cloud by least squares (offline,
-    sa_fitmath) and ranks them by residual: line, plane, circle, sphere,
-    cylinder and cone (free included angle). The result is a ranking plus a
-    `best` pick - not a single verdict, because some shapes are genuinely
-    ambiguous on partial data: a short axial segment fits both a circle and a
-    cylinder, a flat cap both a plane and a huge sphere, a small cone angle
-    reads as a cylinder. RMS alone cannot separate those, so the cloud's
-    gross shape (confined to a plane? collinear? volumetric) breaks the ties:
-    flat clouds prefer the 2D primitive, collinear clouds a line, volumetric
-    clouds a solid (a free circle fit on a non-planar cloud is a degenerate
-    cylinder). Each candidate reports its RMS and degrees-of-freedom adjusted
-    sigma_hat; `confidence` says how separated the best fit is from the
-    runner-up. No geometry is created in SA.
-
-    Point source (one of):
-      - point_group: name of an existing point group (in `collection`), or
-      - points: individual points (same name forms as sa_best_fit_from_points
-        - any groups/collections), or
-      - coordinates: list of [x, y, z] triples (fully offline, no SA needed).
-    At least one is required. Reflector offsets do not change the verdict (a
-    constant offset only shifts the fitted radius/plane, which a free fit
-    absorbs), so the reported parameters describe the measured
-    reflector-centre surface.
-
-    Returns:
-        {ok, best_geometry, best_parameters, confidence, candidates (sorted
-         by quality), cloud, notes, point_source, error?}
-    """
+    """Identify the geometric shape a point cloud was measured from: fits all six
+    primitives offline (sa_fitmath - line, plane, circle, sphere, cylinder, cone
+    with free angle), ranks them by residual and returns a best pick +
+    confidence. Nothing is created in SA; with raw coordinates it is fully
+    offline.
+    RMS alone cannot separate genuine synonyms (a short axis = circle or
+    cylinder; a flat cap = plane or huge sphere), so the cloud's gross shape
+    (planar/collinear/volumetric) breaks the ties; ambiguous results keep
+    confidence low with a note; recognized: False = nothing fits well. Reflector
+    offsets do not change the verdict (a free fit absorbs a constant shift).
+    
+    Point source (one of): point_group (in collection), points (any groups), or
+    coordinates ([[x, y, z], ...]).
+    
+    Returns {ok, best_geometry, best_parameters, confidence, recognized,
+             candidates (ranked), notes, point_source, error?}."""
     if point_group and (coordinates is not None or points):
         return {"ok": False, "error": (
             "Give one point source only: point_group, points or coordinates.")}
@@ -4805,43 +4340,23 @@ def sa_point_coordinates(
     include_offsets: bool = True,
     max_points: int | None = None,
 ) -> dict:
-    """Read the working coordinates (and stored offsets) of points.
-
-    Hands the raw measurements of a point group or of individual points to
-    the client for direct analysis (spread, distances, custom fits, ...) -
-    read-only, nothing is created in SA. Every returned point carries its
-    coordinates in the current working frame plus, when stored, its
-    probe/reflector offsets (the same data SA's own fits compensate for; both
-    are 0.0 for points without stored offsets). Point source is one of:
-      - point_group: an existing point group (bare name inside `collection`,
-        or a full "C::G" name), or
-      - points: individual points - full "C::G::T", group-relative "G::T"
-        (resolved inside `collection`), or bare targets (resolved against
-        `group`); they may span several groups and collections.
-    At least one source is required, and only one of the two.
-
-    Names come back in group/argument order. Coordinates are read one
-    'Get Point Coordinate' step per point; with `max_points` only the first N
-    points are read (`truncated: True`, and `bounds` then describe the
-    returned subset, not the whole group). `include_offsets=False` skips the
-    per-point 'Get Point Properties' step (halves the COM round trips on
-    large groups; the offset keys are then 0.0).
-
-    Args:
-        point_group: Read a whole point group (default "" = not used).
-        collection: Collection of the group / of simple names in `points`.
-        points: Individual points to read instead of a whole group.
-        group: Point group hint for bare target names in `points`.
-        include_offsets: Also read each point's stored probe/reflector
-                         offsets (one extra step per point).
-        max_points: Cap the number of returned points (None = no cap). Use
-                    for very large groups to keep the response small.
-
-    Returns:
-        {ok, source, count, total_points, truncated, offsets_read, bounds
-         ({min, max, centroid} as [x, y, z]), points (list of {name, full, x,
-         y, z, planar_offset, radial_offset}), unresolved, error?}
-    """
+    """Read the working coordinates (+ stored probe/reflector offsets) of a point
+    group or of individual points - a READ-ONLY export for direct analysis,
+    nothing is created in SA.
+    Points come back in order: {name, full, x, y, z, planar_offset, radial_offset}
+    plus bounds {min, max, centroid} of what was returned and total_points /
+    truncated / unresolved. include_offsets=False skips the per-point offset step
+    (halves COM round trips; offset keys are 0.0); max_points caps a huge group
+    (truncated: True).
+    
+    Source (exactly one): point_group (bare name in collection, or full 'C::G'),
+    or points (full 'C::G::T', group-relative 'G::T', or bare with group; may
+    span groups).
+    
+    Args: point_group; collection; points; group; include_offsets; max_points.
+    
+    Returns {ok, source, count, total_points, truncated, offsets_read, bounds,
+             points, unresolved, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -4910,6 +4425,354 @@ def sa_point_coordinates(
         "unresolved": unresolved,
         "error": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Deletion.
+#
+# SA 2015 exposes deletion as two one-shot MP steps - 'Delete Objects'
+# (Collection Object Name Ref List; removes ANY whole object, a point group
+# with all its points included) and 'Delete Points' (Point Name Ref List;
+# removes individual measured points of a group). Both take the SAME joined
+# hierarchical full names the ref-list getters emit (confirmed live on SA
+# 2015 - sa_fit_clean deletes its re-fit geometry and its outliers through
+# exactly these steps). Statuses: 'Delete Objects' -> code 2 SUCCESS, code 4
+# PARTIAL SUCCESS (some names not found), code 3 FAILURE (nothing found);
+# 'Delete Points' always succeeds. One tool below wraps both; the points half
+# runs BEFORE the objects half so a single call that names a group (objects)
+# together with some of its points (points) deletes the points first and the
+# emptied group second.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def sa_delete(objects: list[str] | None = None,
+              points: list[str] | None = None,
+              group: str = "",
+              collection: str = "") -> dict:
+    """Delete whole objects ('Delete Objects') and/or individual points ('Delete
+    Points') in one call. When both are given the points are deleted FIRST, so
+    naming a group under `objects` plus some of its points works in one call.
+    `objects`: whole point groups WITH their points, frames/СК, fitted geometry,
+    vector groups, ...; `points`: individual points of a group. Names: objects
+    full hierarchical ('A::т контур') or simple (in collection); points full
+    'C::G::T', group-relative, or bare (with group). 'Delete Objects' statuses:
+    2 success, 4 partial (objects_partial), 3 nothing found (reported, not
+    raised). A COM error in one half is caught so the other still runs.
+    
+    Args: objects; points; group; collection.
+    
+    Returns {deleted, objects_* / points_* per-half results, messages, error?}."""
+    obj_names = [_object_full_name(o, collection) for o in (objects or [])]
+    pt_names = [_point_full_name(p, group, collection)
+                for p in (points or [])]
+    res = {
+        "deleted": False,
+        "objects": obj_names,
+        "objects_deleted": False,
+        "objects_status_code": None,
+        "objects_status": None,
+        "step_objects": "Delete Objects",
+        "points": pt_names,
+        "points_deleted": False,
+        "points_status_code": None,
+        "points_status": None,
+        "step_points": "Delete Points",
+        "messages": [],
+        "error": None,
+    }
+    if not obj_names and not pt_names:
+        res["error"] = ("Nothing to delete: pass at least one of 'objects' "
+                        "or 'points'.")
+        return res
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+
+    if pt_names:
+        try:
+            sa.set_step("Delete Points")
+            sa.set_point_name_ref_list_arg("Point Names", pt_names)
+            sa.execute_step()
+            code = sa.get_step_result()
+            res["points_status_code"] = code
+            res["points_status"] = MP_STATUS.get(code, f"Unknown({code})")
+            res["messages"] += _safe_messages()
+            res["points_deleted"] = code in (2, 4)
+        except Exception as exc:  # noqa: BLE001
+            res["error"] = (f"{res['error']}; " if res["error"] else "") + \
+                f"'Delete Points' failed: {exc}"
+    if obj_names:
+        try:
+            sa.set_step("Delete Objects")
+            sa.set_collection_object_name_ref_list_arg("Object Names",
+                                                       obj_names)
+            sa.execute_step()
+            code = sa.get_step_result()
+            res["objects_status_code"] = code
+            res["objects_status"] = MP_STATUS.get(code, f"Unknown({code})")
+            res["messages"] += _safe_messages()
+            res["objects_deleted"] = code in (2, 4)
+            if code == 4:
+                res["objects_partial"] = (
+                    "PARTIAL SUCCESS: some of the named objects were not "
+                    "found.")
+        except Exception as exc:  # noqa: BLE001
+            res["error"] = (f"{res['error']}; " if res["error"] else "") + \
+                f"'Delete Objects' failed: {exc}"
+    res["deleted"] = res["points_deleted"] or res["objects_deleted"]
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Coordinate systems (СК = SA "frames") and the working frame.
+#
+# SA 2015's SDK drives these as MP steps, like everything else. Step/arg
+# names below come from the MP Command Reference PDF (ch. 5 Construction
+# Operations / ch. 16 Utility Operations) and are NOT yet confirmed live on
+# SA 2015 - see _live_frames_delete.py, pending live check:
+#   - 'Construct Frame On Object' - creates a frame whose origin and
+#     orientation equal an existing object's local coordinate system (the
+#     axis system of a fitted cylinder/cone, the normal system of a plane, a
+#     line's direction, another frame, ...). in: Reference Object (Collection
+#     Object Name), Frame Name (Collection Object Name, optional).
+#   - 'Construct Frame, Pick origin and point on X axis - clock Z along
+#     working Z' - creates a frame at a measured point, X axis through a
+#     second measured point, Z axis parallel to the current working frame's Z
+#     (a levelled СК through two points). in: Origin Point, Point on X-Axis
+#     (Point Names), Frame Name (optional).
+#   - 'Set Working Frame' - makes a frame the working frame ("активировать
+#     СК"). in: New Working Frame Name (Collection Object Name). Only ONE
+#     frame is the working frame at a time, so setting frame B implicitly
+#     deactivates frame A. SA 2015 has no "inactive" state for a frame;
+#     "деактивировать" a custom СК means switching the working frame back to
+#     SA's built-in WORLD frame (sa_reset_working_frame).
+#   - 'Get Working Frame Properties' - reads the current working frame back
+#     (out: Frame Name, Collection Name; always succeeds).
+# SA never OVERWRITES a frame whose name already exists - a second construct
+# silently auto-suffixes the name ("X", "X1", ...), so the create tool
+# deletes a pre-existing same-named object first (replace=True), mirroring
+# the replace semantics of the fixed-fit / projection tools.
+# ---------------------------------------------------------------------------
+
+
+def _co_name_parts(full_name):
+    """Split a joined "C::O" object name into (collection, object).
+
+    Accepts the full hierarchical names sa_inspect_project emits
+    ("A::т контур"), the leading-"::" current-collection form ("::X"), and a
+    bare name ("X").
+    """
+    s = str(full_name)
+    if s.startswith("::"):
+        return "", s[2:]
+    if "::" in s:
+        return s.split("::", 1)
+    return "", s
+
+
+@mcp.tool()
+def sa_create_frame(frame_name: str,
+                    method: str = "",
+                    reference_object: str = "",
+                    origin_point: str = "",
+                    point_on_x_axis: str = "",
+                    collection: str = "",
+                    group: str = "",
+                    replace: bool = True) -> dict:
+    """Create a coordinate system (СК = SA 'frame'). Step/arg names are from the MP
+    Command Reference PDF - live check pending (_live_frames_delete.py).
+    method='on_object' (default when `reference_object` given): frame whose origin
+    + orientation equal the object's local CS - a fitted cylinder (axis along it),
+    cone, plane (normal), line, sphere, circle, or another frame ('Construct Frame
+    On Object').
+    method='origin_x_axis' (default when both points given): frame at measured
+    point origin_point, X axis through point_on_x_axis, Z parallel to the current
+    working frame's Z - a levelled СК through two points.
+    SA never overwrites a frame (silent 'X1' suffix), so replace=True (default)
+    deletes a same-named frame first - exactly one frame under frame_name remains.
+    
+    Args: frame_name (required); method: 'on_object' | 'origin_x_axis' | ''
+          (derive from args); reference_object / origin_point / point_on_x_axis:
+          per method (bare point names need `group`); collection; group; replace.
+    
+    Returns {created, step, method, frame_name, full_name, replaced, status_code,
+             status, messages, error?}."""
+    name = str(frame_name)
+    full_name = _object_full_name(name, collection)
+    res = {"created": False, "step": None, "method": method,
+           "frame_name": name, "full_name": full_name,
+           "collection": collection, "replaced": False, "status_code": None,
+           "status": None, "messages": [], "error": None}
+    if not name.strip():
+        res["error"] = ("frame_name is required: SA auto-names/suffixes a "
+                        "frame otherwise and the result is not deterministic.")
+        return res
+    if not method:
+        if reference_object:
+            method = "on_object"
+        elif origin_point and point_on_x_axis:
+            method = "origin_x_axis"
+    method = str(method).strip().lower()
+    res["method"] = method
+    if method == "on_object":
+        step = "Construct Frame On Object"
+        if not str(reference_object).strip():
+            res["error"] = "method 'on_object' requires 'reference_object'."
+            return res
+    elif method == "origin_x_axis":
+        step = ("Construct Frame, Pick origin and point on X axis - clock Z "
+                "along working Z")
+        if not str(origin_point).strip() or not str(point_on_x_axis).strip():
+            res["error"] = ("method 'origin_x_axis' requires both "
+                            "'origin_point' and 'point_on_x_axis'.")
+            return res
+    else:
+        res["error"] = ("unknown method '%s' (use 'on_object' or "
+                        "'origin_x_axis')." % method)
+        return res
+    res["step"] = step
+
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+
+    try:
+        if replace:
+            sa.set_step("Delete Objects")
+            sa.set_collection_object_name_ref_list_arg(
+                "Object Names", [full_name])
+            sa.execute_step()
+            if sa.get_step_result() in (2, 4):
+                res["replaced"] = True
+        sa.set_step(step)
+        if method == "on_object":
+            coll, obj = _co_name_parts(
+                _object_full_name(reference_object, collection))
+            sa.set_collection_object_name_arg("Reference Object", coll, obj)
+        else:
+            for arg_name, point in (("Origin Point", origin_point),
+                                    ("Point on X-Axis", point_on_x_axis)):
+                coll, grp, target = _point_ref_parts(
+                    _point_full_name(point, group, collection))
+                sa.set_point_name_arg(arg_name, coll, grp, target)
+        name_arg = _set_first_arg(
+            sa.set_collection_object_name_arg,
+            ["Frame Name (Optional)", "Frame Name"], collection, name)
+        if name_arg is None:
+            res["error"] = ("None of the frame-name arg candidates were "
+                            "accepted - check the step arg names.")
+            return res
+        sa.execute_step()
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] = _safe_messages()
+        res["created"] = code == 2
+        if code != 2:
+            res["error"] = (f"{step} returned {res['status']} (code {code}) "
+                            "- the frame was NOT created.")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+@mcp.tool()
+def sa_set_working_frame(frame_name: str, collection: str = "") -> dict:
+    """Make a frame the working coordinate system (активировать СК) - the frame
+    every construction and coordinate read is reported in ('Set Working Frame').
+    Only ONE frame is working at a time: activating frame B implicitly
+    deactivates frame A.
+    
+    Args: frame_name: full 'C::O' or simple (in collection); pass 'WORLD' for the
+          built-in world frame (see sa_reset_working_frame); collection: '' =
+          current.
+    
+    Returns {activated, step, frame_name, full_name, status_code, status,
+             messages, error?}."""
+    name = str(frame_name)
+    full_name = _object_full_name(name, collection)
+    res = {"activated": False, "step": "Set Working Frame",
+           "frame_name": name, "full_name": full_name,
+           "collection": collection, "status_code": None, "status": None,
+           "messages": [], "error": None}
+    if not name.strip():
+        res["error"] = "frame_name is required."
+        return res
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+    try:
+        sa.set_step("Set Working Frame")
+        coll, obj = _co_name_parts(full_name)
+        sa.set_collection_object_name_arg("New Working Frame Name", coll, obj)
+        sa.execute_step()
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] = _safe_messages()
+        res["activated"] = code == 2
+        if code != 2:
+            res["error"] = (f"'Set Working Frame' returned {res['status']} "
+                            f"(code {code}) - the frame was not activated "
+                            "(not found?).")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+@mcp.tool()
+def sa_reset_working_frame() -> dict:
+    """Return the working coordinate system to WORLD (деактивировать СК).
+    A frame has no 'off' state - SA always has exactly one working frame, so
+    deactivating a custom СК means switching back to the built-in WORLD frame.
+    Equivalent to sa_set_working_frame('WORLD'); verify with
+    sa_current_working_frame.
+    
+    Returns {activated, step, frame_name, full_name, status_code, status,
+             messages, error?}."""
+    return sa_set_working_frame("WORLD")
+
+
+@mcp.tool()
+def sa_current_working_frame() -> dict:
+    """Report the current working coordinate system ('Get Working Frame Properties',
+    always succeeds) - verify what sa_set_working_frame / sa_reset_working_frame
+    left active.
+    
+    Returns {ok, step, frame_name, collection, status_code, status, messages,
+             error?}."""
+    res = {"ok": False, "step": "Get Working Frame Properties",
+           "frame_name": None, "collection": None, "status_code": None,
+           "status": None, "messages": [], "error": None}
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+    try:
+        sa.set_step("Get Working Frame Properties")
+        sa.execute_step()
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] = _safe_messages()
+        if code == 2:
+            res["frame_name"] = sa.get_string_arg("Frame Name")
+            res["collection"] = sa.get_string_arg("Collection Name")
+            res["ok"] = True
+        else:
+            res["error"] = (f"'Get Working Frame Properties' returned "
+                            f"{res['status']} (code {code}).")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
 
 
 # ---------------------------------------------------------------------------
