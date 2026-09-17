@@ -64,10 +64,15 @@ Manual testing: `npx -y @modelcontextprotocol/inspector python server.py`.
 | `sa_dialog_watchdog` | Background auto-closer of SA modals (`start`/`stop`/`status`). Armed automatically; acts only while a COM call is in flight, so manual GUI work is never interrupted. |
 | `sa_run_step`, `sa_construct_point` | Generic step runner + example tool. |
 | `sa_delete` | Delete objects (whole groups/frames/geometry: `Delete Objects`) and/or individual points of a group (`Delete Points`) in one call (points first). |
+| `sa_average_groups` | Average several point groups into one group by matching target name (`Average a set of Groups`) — the "USMN as an averager" job, no instruments or network solving. Coordinates are a plain arithmetic mean; the step's RMS/avg/max describe the WORST point, not the whole merge. Replaces a same-named result group by default. |
+| `sa_unify_groups` | Unify several point groups — **align by LSQ AND merge** ("усреднение с совмещением по МКН"). `method="usmn"` (default) runs `Locate Instruments (USMN)` with `AutoReject Outliers and Resolve` — the iterative auto-rejection of bad points; instruments are derived from the source groups' observations and every other point group of the collection is excluded (a re-used target name makes USMN fail silently), and the solve is retried because it is non-deterministic. `method="fit"` is the explicit fallback: copy → `Best Fit Transformation - Group to Group` → apply → `Average a set of Groups` (no outlier rejection). Reports the step's RMS plus its own deterministic per-source `agreement` block. **`method="usmn"` is not a plain average**: USMN has its own weighting scheme, so its composite sits ~0.03 mm off the mean of the same groups and the solve also relocates the instruments in the job (so the source groups move). `method="fit"` reproduces the arithmetic mean exactly and changes nothing. |
 | `sa_create_frame` | Create a СК (frame): on an existing object's local CS, or origin + X-axis through two measured points (Z along working Z). Replaces a same-named frame by default. |
 | `sa_set_working_frame` / `sa_reset_working_frame` / `sa_current_working_frame` | Activate a СК / deactivate (back to WORLD) / read the active one. |
+| `sa_move_objects` | Move objects **in place** — translation and rotation — relative to a СК: a 6-DOF delta in the active working frame (default), translation only, a delta in WORLD (+scale), or the delta between two named frames. |
+| `sa_object_transform` | Read one object's pose (4×4 matrix + Fixed XYZ X/Y/Z, Rx/Ry/Rz) in the active working frame — capture it before/after a move. |
+| `sa_best_fit_transform` | **Best-fit (МНК) transform moving one point group ONTO another** (`Best Fit Transformation - Group to Group`), with a full deviation report and an optional move. Choose the fit freedoms (`allow_x/y/z/rx/ry/rz`, `allow_scale`). Every point's deviation is recomputed from the returned transform and listed **worst first**; `tolerance_mm` flags the ones past it as `outliers` without excluding anything. `exclude_points` re-fits without the named targets (temp copies of both groups, removed afterwards) — the "drop the bad point and recompute" loop; excluded points keep their deviation under `excluded_deviations`. `apply=True` moves the corresponding group **plus** everything named in `move_objects` in one step (frames/СК, fitted geometry, vector groups built on it travel with it), and `verify_after_move` re-reads the result. |
 | `sa_inspect_project` | List collections, or objects-by-type in a collection (full hierarchical names, optionally points per group). |
-| `sa_point_coordinates` | Read-only export of working coordinates (+ stored offsets) of a group or an explicit point list. |
+| `sa_point_coordinates` | Read-only export of working coordinates (+ stored offsets) of a group or an explicit point list. `format="canvas"` is a token-lean variant: the whole set as one CSV text, constant offsets reported once. |
 | `sa_best_fit` + `sa_best_fit_<shape>` | Best-fit plane/sphere/cylinder/cone/circle/line. |
 | `sa_best_fit_from_points` | Best fit to an explicit point list across any groups/collections. |
 | `sa_fit_fixed` + `sa_fit_fixed_<shape>` | Fit with a FIXED radius/diameter/apex angle and a chosen compensation side. |
@@ -100,6 +105,32 @@ sa_reset_working_frame()                              # back to WORLD
 sa_delete(objects=["MCP_BF_цилиндр_старый"],
           points=["Опорная сеть::1", "Опорная сеть::2"], group="Опорная сеть",
           collection="A")
+
+# Move objects relative to a СК (translation + rotation, in place):
+sa_move_objects(objects=["MCP_BF_цилиндр"], dx=10, dz=-2.5,
+                rx=0, ry=0, rz=90, collection="A")
+# -> the 6-DOF delta is applied in the ACTIVE working frame, rotations about
+#    its origin; activate the target СК first with sa_set_working_frame.
+sa_move_objects(objects=["MCP_BF_цилиндр"], mode="frame_to_frame",
+                source_frame="СК_исходная", destination_frame="СК_новая",
+                collection="A")          # move BY the delta between two СК
+sa_object_transform(object="MCP_BF_цилиндр", collection="A")
+# -> {ok: True, matrix: [...], fixed_xyz: {x, y, z, rx, ry, rz}}
+
+# МНК-совмещение одной группы с другой: посмотреть отклонения, убрать плохую
+# точку, пересчитать, затем переместить группу вместе с её окружением.
+sa_best_fit_transform(reference_group="Номинал", corresponding_group="Замер",
+                      collection="A", tolerance_mm=0.2)
+# -> {computed: True, matrix: [...], fixed_xyz: {...},
+#     stats: {rms_deviation, max_deviation, ...}, pairs: N,
+#     deviations: [{target, deviation, included, outlier}, ...],  # worst first
+#     outliers: ["4"], worst_point: {...}}
+sa_best_fit_transform(reference_group="Номинал", corresponding_group="Замер",
+                      collection="A", exclude_points=["4"],
+                      apply=True, move_objects=["СК_узла", "цилиндр_узла"])
+# -> the fit drops target 4 (temp copies of both groups, then deleted) and the
+#    corresponding group + the two companions move in one step;
+#    stats_after_move re-reads the result to prove it landed on the reference.
 
 # Identify a cloud's shape fully offline:
 sa_identify_geometry(coordinates=[[x, y, z], ...])

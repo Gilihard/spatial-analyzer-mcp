@@ -70,8 +70,14 @@ Query steps), -1 SdkError (usually a wrong step/arg name).
    new out-param getter or "Type" enum setter follows this pattern — NOT
    `_call()`/`_unwrap()`. SAFEARRAY args must be a PLAIN Python list under an
    explicit `VT_VARIANT|VT_BYREF` descriptor; wrapping in a win32com VARIANT
-   raises DISP_E_TYPEMISMATCH. (Plain-value args like Projection Options go
-   through dynamic dispatch fine.)
+   raises DISP_E_TYPEMISMATCH. **Exception — a `Transform` arg** (= a `VARIANT*`
+   holding a 2-D 4×4 `VT_R8` SAFEARRAY, as in `SetTransformArg` /
+   `SetWorldTransformArg`): the array ELEMENT TYPE matters, so it must be the
+   opposite — `VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, nested4x4)` from
+   `sa_sdk._matrix_variant()`, still under a `VT_VARIANT|VT_BYREF` descriptor.
+   A bare nested list makes pywin32 build `VT_ARRAY|VT_VARIANT`, and SA then
+   reads element 0's `vt` header as a double (2.5e-323 garbage). (Plain-value
+   args like Projection Options go through dynamic dispatch fine.)
 4. **Non-ASCII paths** (Cyrillic `.xit` paths): never type them inline into a
    REPL over a pipe (console codepage mangles bytes → "file not found").
    Read them from a UTF-8 `.py` file or pass programmatic values only.
@@ -88,6 +94,25 @@ Query steps), -1 SdkError (usually a wrong step/arg name).
    interval env `SA_MCP_WATCHDOG_INTERVAL`, default 0.5 s; optional
    `title_contains`). A dialog that pops between steps is cured by the next
    step blocking on it. Offline regressions: `_t_dialogs.py`, `_t_openlogic.py`.
+6. **Nothing may run between the `Set*Arg` calls of a step and its
+   `ExecuteStep()`.** Any other step that *executes* re-arms the engine's
+   current step, so the following `ExecuteStep()` runs THAT step instead and
+   reports success having done nothing (a frame that "was created" but never
+   appeared). Enumeration / verification calls therefore go BEFORE
+   `set_step(<the step>)`, never inside — see `sa_create_frame`'s
+   `before = _frame_full_names(...)`, which sits above the `set_step`.
+7. **A `Set*Arg` return value proves nothing.** Every arg setter returns True
+   even for a bogus arg NAME — live-verified across the double / bool /
+   collection-object / ref-list / instrument-ref-list / enum setters. So a
+   True return can never validate an arg name or a value's spelling; the only
+   evidence is what the step then DID (status + the object it created). This
+   is why `sa_create_frame` verifies by enumeration, and why a silently
+   ignored arg name shows up as "the step succeeded but did nothing".
+   Related: SA 2015's `GetMPStepMessages` (the step's text log, an [out]
+   `VARIANT*`) is NOT readable through COM on this build — every transport
+   fails (61704 / DISP_E_TYPEMISMATCH / empty). `SABridge.get_step_messages`
+   swallows that and returns `[]`, so tools report their own status; a USMN
+   FAILURE therefore arrives with NO explanatory text.
 
 ## SA data model — names & ref lists
 - A job (.xit) = collections → objects (point groups, vector groups, frames,
@@ -136,14 +161,40 @@ Query steps), -1 SdkError (usually a wrong step/arg name).
 - Syntax: `python -m py_compile sa_sdk.py sa_app.py server.py test_sdk.py`.
 - Offline regressions (no SA/COM): `python _t_dialogs.py` (dialog close),
   `_t_openlogic.py` (watchdog gate + attach logic), `_t_identify.py`
-  (shape classification), `_t_frames_delete.py` (delete/frame/СК logic),
-  `_t_fitmath.py` (fixed-fit math), `_t_cardinal_logic.py` (cardinal purge).
+  (shape classification), `_t_frames_delete.py` (delete/frame/СК logic +
+  `Construct Frame` arg-setter/ordering/active-collection contract),
+  `_t_fitmath.py` (fixed-fit math), `_t_cardinal_logic.py` (cardinal purge),
+  `_t_move.py` (transform matrix transport + move-mode validation),
+  `_t_average.py` (group-averaging arg names/setter types/ordering),
+  `_t_unify.py` (USMN arg contract + retry, exclusion derivation, `fit`
+  pipeline ordering + temp cleanup), `_t_fit_transform.py` (sa_best_fit_transform
+  arg/DOF contract, deviation math + worst-first sort, the exclude→temp-copy→
+  refit path incl. the ineffective-delete guard, apply + `stats_after_move`).
+  All of
+  them force the offline path themselves (`no_sa` / a fake bridge), so they
+  stay deterministic even when a live SA is up — do not make a regression
+  depend on SA actually being closed.
 - Live harnesses (SA free, no other engine connected): `_live_vectors.py`
   (compare/vector groups), `_live_frames_delete.py` (delete/frame/СК),
-  `_live_proj.py` (projection), `_live_showhide.py`, `_live_fixed2.py` /
-  `_live_fixed3.py` (fixed fits). Keep one engine alive; cleanup MCP_* objects.
+  `_live_transform.py` (move/transform: matrix round-trip, translation,
+  rotation pivot, world, frame-to-frame, pose read-back), `_live_proj.py`
+  (projection), `_live_showhide.py`, `_live_fixed2.py` / `_live_fixed3.py`
+  (fixed fits), `_live_average.py` (group averaging; boots SA with the fixture
+  itself, verifies the mean against a Python one), `_live_unify.py`
+  (`sa_unify_groups` both methods, each on a fresh copy of the fixture, then
+  compares the two composites and checks for leftover `MCP_UNIFY*` temps),
+  `_live_fit_transform.py` (`sa_best_fit_transform`: the МНК transform's
+  direction + our recomputed RMS against the step's own, the
+  exclude→refit collapse, apply + companion move).
+  Keep one engine alive; cleanup MCP_* objects.
+- SA 2015 serves ONE SDK client at a time (live 2026-09-10): a second process
+  calling `_ensure_sa()` gets `Connect` True with an EMPTY job (or Connect
+  fails), and repeatedly spawning engines wedges the listener. So a live
+  harness must OWN the session — run it while no MCP tool holds a connection
+  (the MCP server's bridge keeps `connected=True` cached, so after killing
+  `SpatialAnalyzerSDK.exe` its COM tools stay broken until MCP is reloaded).
 
-## Tools (server.py, ~36)
+## Tools (server.py, ~41)
 - Process/boot: `sa_status` (never spawns the bridge), `sa_is_running`,
   `sa_launch`, `sa_ensure_running`, `sa_open_file` (raw `Open SA File`
   semantics), `sa_connect`.
@@ -151,17 +202,39 @@ Query steps), -1 SdkError (usually a wrong step/arg name).
   `sa_current_file()` — see "Attach-first open" below.
 - Dialogs: `sa_dismiss_dialogs`, `sa_dialog_watchdog`.
 - Generic: `sa_run_step`, `sa_construct_point`.
+- Group averaging: `sa_average_groups(source_groups, result_group, …)` —
+  averages several point groups into ONE group by matching target name (the
+  "USMN as an averager" job, with no instruments/network solving); see
+  "Group averaging" below.
+- Network unify: `sa_unify_groups(source_groups, result_group, method="usmn",
+  auto_reject=True, …)` — LSQ-align the groups AND merge them, with USMN's
+  iterative auto-rejection of bad points; `method="fit"` is the explicit
+  copy→best-fit→average fallback. See "USMN unify" below.
 - Delete/frames: `sa_delete(objects=…, points=…)` — both deletion steps in
   one call, points half runs FIRST (so an emptied group can be deleted in the
   same call); `sa_create_frame` (`method="on_object"` | `"origin_x_axis"`,
   replace same-named frame by default); `sa_set_working_frame` (activate),
   `sa_reset_working_frame` (= set WORLD), `sa_current_working_frame`.
+- Move/transform: `sa_move_objects(objects, dx…rz, mode=…)` — in-place
+  translation + rotation of any objects against a СК (see "Move objects"
+  below); `sa_object_transform(object)` — read one object's 4×4 matrix +
+  Fixed XYZ pose in the active working frame.
+- Best-fit transform (МНК-совмещение групп): `sa_best_fit_transform(
+  reference_group, corresponding_group, …)` — fit one group ONTO another by
+  LSQ, report every point's deviation, exclude bad points and refit, then
+  optionally MOVE the group together with named companions. See "Best-fit
+  transform" below.
 - Inspect/data: `sa_inspect_project` (collections, or objects-by-type in a
   collection — full hierarchical names, optionally the points per point
   group), `sa_point_coordinates` (READ-ONLY working-coord export of a group
   or explicit point list + stored offsets; `include_offsets=False` halves COM
-  round trips; `max_points` caps; nothing created in SA; NOT yet exercised
-  live).
+  round trips; `max_points` caps; `format="canvas"` is the TOKEN-LEAN output —
+  the whole set as ONE CSV text (x,y,z per line, nothing repeated per point;
+  constant planar/radial offsets, e.g. one SMR radius, reported once under
+  `offsets`; `decimals` trims, trailing zeros dropped). The read itself stays
+  per-point COM ('Get Point Coordinate' × N; SA 2015 MP has no bulk
+  coordinate-read step; the batch route is the PDF 'Export ASCII Points' file
+  step, not yet live); nothing created in SA; NOT yet exercised live).
 - Fit: `sa_best_fit` + typed `sa_best_fit_{plane,sphere,cylinder,cone,
   circle,line}`; `sa_best_fit_from_points` (explicit point list across any
   groups); `sa_fit_fixed` + `sa_fit_fixed_{cylinder,sphere,circle,cone}`
@@ -247,6 +320,120 @@ only `sa_open_file` still uses it; don't reintroduce socket-style probing.
   `Cone Length`, `Cone Theta Start`, `Cone Theta Span`, `Cone Included
   Angle`. Read via `get_double_arg`/`get_vector_arg`.
 
+**Group averaging** (live 2026-09-10; GUI Construct > Points > Average a set
+of Groups): `Average a set of Groups` — in `Group Names` (Collection Object
+Name Ref List), `Resulting Group Name` (Collection Object Name), `RMS
+Tolerance (0.0 for none)` / `Maximum Absolute Tolerance (0.0 for none)` /
+`Maximum Average Tolerance (0.0 for none)` (Double); out `RMS Deviation` /
+`Max Absolute Deviation` / `Average Deviation` (Double). Transport is the
+standard ref-list + collection-object-name + doubles — all live-proven, no
+new bridge helper. "Points with matching names from different groups are
+averaged": matching is by TARGET name, the group prefix is ignored (live:
+«Опорная сеть»/`LocateInstMeas1`/`LocateInstMeas1*` → one point per target
+1…6; target 5 present in only 2 of the 3 groups was averaged over those 2).
+The result INHERITS the source target names and its coordinates are a plain
+ARITHMETIC mean (verified to ~1e-13 mm against a Python mean in
+`_live_average.py`). The three returned deviations are the WORST POINT's
+RMS / mean / max distance to its own averaged point — NOT whole-merge
+aggregates (SA's RMS equalled the worst target's per-target RMS exactly), and
+the tolerances are judged on those same worst-point values. Statuses are
+unreliable (PARTIAL SUCCESS = "averaged, but a tolerance failed"; FAILURE is
+documented as both "no source group found" and "a tolerance failed") → decide
+success by the result group's content.
+`Construct Point (Fit to Points)` is the single-point sibling ("mathematical
+average of the source points"; in `Point Names`, `Resulting Point Name`).
+
+**USMN unify** (live 2026-09-10; `sa_unify_groups`; GUI Construct > Points >
+Locate Instruments / USMN): `Locate Instruments (USMN)` — the ONE SA step that
+both LSQ-aligns and merges, i.e. "усреднение с совмещением по МКН". in:
+`Instruments to Locate` (**Collection Instrument ID Ref List** — elements are
+joined `"A::0"`, set via `sa.set_col_inst_id_ref_list_arg`; the instrument id
+is a LONG in the C++ header, not a name, hence the dedicated `SetColInstIdArg`
+/ `SetColInstIdRefListArg` helpers), `Nominals Group Name (blank for none)`
+(Collection Object Name — pass `("", "")` for none), `Output Group Name (to be
+established)` (Collection Object Name), `AutoReject Outliers and Resolve`
+(Bool — the iterative rejection of bad points), `Max Acceptable RMS Error
+Value (0.0 for none)` / `Max Acceptable Error Value (0.0 for none)` (Double),
+`Groups to be Excluded` (Collection Object Name Ref List), `Exclude Points
+Measured By Only One Instrument` (Bool). out `RMS Error Value` / `Max Error
+Value` (Double). Instrument discovery (SA 2015 has no "list all instruments"
+step): `Get Instruments with Observations on Target` — in `Point Name` (a
+point-name arg, so the target must be the BARE name: a group-relative
+`"G::1"` or a bare `"1"` with the group/collection passed separately), out
+`Resultant Collection Instrument Reference List` (elements `"A::0"`).
+Five live lessons, all of which the tool bakes in:
+1. **Name collision = silent FAILURE.** USMN matches targets BY NAME across
+   the WHOLE JOB — not just the named groups. On the fixture each source group
+   is measured by exactly ONE instrument («Опорная сеть»→`A::0`,
+   `LocateInstMeas1`→`A::2`, `LocateInstMeas1*`→`A::3`), so the network is
+   connected ONLY by namesake target names; if another group of the job reuses
+   those names the solve becomes ambiguous and the step returns status 3 with
+   NO message (messages are unreadable, see non-negotiable #7). «т контур»
+   (targets 1…376) collides with «Опорная сеть»'s 1…6 — passing every other
+   point group of the collection as `Groups to be Excluded` turns status 3
+   into status 2, hence `exclude_other_groups=True` by default. Removal of the
+   exclusion reproduces the failure (4/4 attempts) with auto-reject either
+   way, so the exclusion is load-bearing, not cosmetic.
+2. **A solve RELOCATES instruments; the job is never the same afterwards.**
+   Measured on the fixture: `A::2`'s group moved up to 0.0269 mm, `A::3`'s
+   0.0346 mm, `A::0` (the held reference) 0.000000 mm, and «т контур» moved
+   too. The composite itself IS reproducible — two runs on the same job gave
+   identical points (0.000000 mm) — but an experiment must still start from a
+   pristine copy to mean anything (the live harnesses copy the fixture to a
+   unique name first: SA locks the opened .xit, so a fixed working name gives
+   `PermissionError` on the second attempt). The tool retries up to
+   `max_attempts` because the first attempt frequently fails outright, and
+   accepts only `code == 2` with points actually created.
+3. **The reported RMS is flaky.** `RMS Error Value` came back as an exact 0.0
+   on some runs whose composite group was bit-identical to a run reporting
+   0.01116. `sa_unify_groups` therefore computes its own `agreement` block
+   (per-point 3-D distance from every source point to its merged counterpart,
+   matched by target name, overall + per source group) and falls back to it
+   when the step's numbers are missing/zero.
+4. **Nothing to solve → still a FAILURE.** With no instrument observations on
+   the sources the step fails; `method="fit"` is the fallback.
+5. **The composite is NOT the arithmetic mean** (live 2026-09-10, and the
+   cause of a real user report "разница 0,02 — это очень много"). SA's own
+   resources say it: *"...do not apply to USMN as it has its own weighting
+   scheme"* — the step writes a weighted LSQ estimate of each target, and it
+   is not the mean of the measurements. Measured on the fixture (vs the plain
+   arithmetic mean of the three groups): rms 0.026369 mm / max 0.049929 mm.
+   NOTHING makes it the mean — the instrument list is inert
+   (`A::0/A::2/A::3` == `A::0/A::1/A::2/A::3` == `+exclude_single_observation`
+   to 1e-6 mm; instrument `A::1` has no observations on these targets) and
+   `auto_reject=False` only moves it to rms 0.016630 mm. `method="fit"`, by
+   contrast, reproduces the plain mean EXACTLY (0.000000 mm against an
+   independently computed Python mean) and moves nothing (0.000000 mm), which
+   matters because the three groups are already nearly co-registered (fitted
+   alignment RMS 0.0388 / 0.0327 mm, transform ≈ identity). So:
+   **want the mean → `method="fit"`; want SA's weighted network solution (and
+   instrument relocation) → `method="usmn"`.** A GUI USMN composite was
+   observed to equal the arithmetic mean of the groups exactly, so the SDK
+   step and the GUI do NOT produce the same estimator here; the only input arg
+   never set is #4 `Show USMN Dialog` (enum, spellings undocumented), and
+   `ShowUsmnDialogType`'s value is the remaining suspected difference.
+`method="fit"` pipeline (explicit, always available): `Copy Object` (in
+`Source Object`, `New Object Name` — both Collection Object Name — and
+`Overwrite If Exists?`) every source to `MCP_UNIFY_<i>`; `Best Fit
+Transformation - Group to Group` (in `Reference Group`, `Corresponding
+Group`, `Show Interface`, `RMS Tolerance (0.0 for none)`, `Maximum Absolute
+Tolerance (0.0 for none)`, `Allow Scale`, `Allow X`…`Allow Rz`; out `RMS
+Deviation`, `Maximum Absolute Deviation`, `Transform in Working`) each copy
+onto the reference copy; `Transform Objects by Delta (About Working Frame)`
+with that matrix; then `Average a set of Groups` on the COPIES; then delete
+the temps in a `finally`. Direction (live-verified with a deliberate +1 mm
+misalignment): `Transform in Working` maps the CORRESPONDING group ONTO the
+REFERENCE. `method="fit"` does NOT do outlier rejection — say so rather than
+implying it (per-group `sa_fit_clean` is the tool for that).
+Returns: `{unified, method, result_group, source_groups, instruments,
+groups_excluded, result_count, stats {rms, max_absolute}, agreement {overall
+{rms, max_absolute, pairs}, by_group}, alignment (fit only), reference_group,
+attempts, replaced, status_code, status, messages, error?}`. On the fixture
+(«Опорная сеть» 6 pts + `LocateInstMeas1` 6 + `LocateInstMeas1*` 5) USMN
+yields a 6-point composite, instruments `A::0/A::2/A::3`, excluded
+`A::т контур`, `A::БО`, `A::ц.ц`; `usmn` sits rms 0.0264 mm (max 0.0499) off
+`fit`, entirely because of the weighted solve described in lesson 5.
+
 **Query Points to Objects** (live; GUI Construct > Points > Project Points
 to > Objects > Closest Point and Compare > Points > Objects): engine creates
 either a point group of projected points or a deviation-whisker VECTOR group
@@ -304,24 +491,131 @@ Deviation`.
   updates. Tolerance values feed the in/out stats `Get Vector Group
   Properties` reads back.
 
-**Frames / working frame** (PDF — NOT yet live, pending
-`_live_frames_delete.py`):
+**Frames / working frame** (live):
 - `Construct Frame On Object` — in `Reference Object` (Collection Object
-  Name): frame with the object's local CS (cylinder axis / plane normal /
-  line direction / another frame …).
+  Name) + `Frame Name (Optional)` (**Collection Object Name**: pass the
+  collection and the bare object name, `sa.set_collection_object_name_arg`):
+  frame with the object's local CS (cylinder axis / plane normal / line
+  direction / another frame …).
 - `Construct Frame, Pick origin and point on X axis - clock Z along working
-  Z` — in `Origin Point`, `Point on X-Axis` (Point Names): frame at a
-  measured point, X through a second point, Z ∥ working Z (levelled СК).
-- Result-name arg tried as `Frame Name (Optional)` then `Frame Name`
-  (`_set_first_arg`).
+  Z` — in `Origin Point`, `Point on X-Axis` (Point Names) + `Frame Name
+  (Optional)` (**plain Frame Name** here: `sa.set_frame_name_arg(name)`):
+  frame at a measured point, X through a second point, Z ∥ working Z
+  (levelled СК).
+- The two steps type their result-name arg DIFFERENTLY, and both setters
+  return True for a name they did not store (live): the wrong one gives
+  SdkError -1 (on_object) or silently auto-names the frame (two-point) — which
+  is why `sa_create_frame` picks the setter per step and then verifies by
+  enumeration (`created_objects` / `name_applied`, plus a `warning` when the
+  name did not stick).
+- **Neither Construct Frame step takes a collection** — the frame lands in the
+  ACTIVE collection. `sa_create_frame` therefore activates the requested one
+  (`Set (or construct) default collection`, in `Collection Name`) and restores
+  the previous one afterwards (`Get Active Collection Name`, out `Currently
+  Active Collection Name`; reported as `active_collection_before` /
+  `active_collection_after`).
 - `Set Working Frame` — in `New Working Frame Name` (Collection Object
   Name); only ONE frame is working — setting B deactivates A (no inactive
   state). `sa_reset_working_frame()` = set `WORLD`.
 - `Get Working Frame Properties` — out `Frame Name`, `Collection Name`
   (String; always succeeds).
-- No transform-based `Construct Frame`: `SetTransformArg` takes a 4×4
-  SAFEARRAY VARIANT whose Python transport is not live-verified — do not add
-  without a live check.
+
+**Move objects — translation + rotation against a СК** (live;
+`sa_move_objects`, `sa_object_transform`):
+- The 6-DOF delta (`dx/dy/dz` mm + `rx/ry/rz` FIXED XYZ degrees, Rx roll /
+  Ry pitch / Rz yaw) is expressed in the **ACTIVE working frame**; rotations
+  are applied **about the working frame's ORIGIN** (verified live: a point at
+  +X rotated 90° about Z lands at +Y **of the activated frame**, and the pivot
+  moves with it — so `sa_set_working_frame` FIRST to move relative to a given
+  СК). This is the GUI Edit > Move Objects > Enter Transformation path; the СК
+  is never a step argument, only the active one.
+  mode → step:
+  - `about_working_frame` (default): `Transform Objects by Delta (About
+    Working Frame)` — in `Objects to Transform` (Collection Object Name Ref
+    List) + `Delta Transform`, no scale.
+  - `world`: `Transform Objects by Delta (World Transform Operator)` — same
+    args plus a scale (`set_world_transform_arg(name, matrix, scale)`).
+  - `translate` (translation only, `rx/ry/rz` must be 0): `Translate Objects
+    by Delta` — in `Objects to Translate` + `Delta Translation` (a Vector arg,
+    `set_vector_arg`).
+  - `frame_to_frame` (move BY the delta between two named frames, ignores the
+    numeric deltas): `Transform Objects - Frame To Frame` — in `Object Name
+    List`, `Initial Frame Name`, `Destination Frame Name` (all Collection
+    Object Name / their ref list) + `Number of Steps` (Integer, 0).
+- The 4×4 delta is composed by SA itself so its Fixed XYZ convention is used
+  verbatim: `Make a Transform from Doubles (Fixed XYZ)` (in the six doubles +
+  out a Transform) — never build the matrix in Python. The inverse read is
+  `Decompose Transform into Doubles (Fixed XYZ)`, and the pose read is
+  `Get Working Transform of Object (Fixed XYZ)` (in `Object Name`).
+- Transform transport (see non-negotiable #3): `sa_sdk._matrix_variant()` —
+  `VARIANT(VT_ARRAY | VT_R8, nested4x4)` under a `VT_VARIANT|VT_BYREF`
+  descriptor. Regression `_t_move.py` pins the declared type; `_live_transform.py`
+  proves the round-trip (translation lands in matrix column 3, bottom row
+  0 0 0 1, angles exact in degrees).
+- **SA never overwrites**: `sa_move_objects` moves in place (no copy, no new
+  name); a partial code 4 means at least one named object was not found
+  (`objects_partial` in the response).
+
+**Best-fit transform — МНК-совмещение одной группы с другой** (live 2026-09-10;
+`sa_best_fit_transform`; GUI Edit/Analysis "Best Fit Transformation"):
+- `Best Fit Transformation - Group to Group` — in: `Reference Group`,
+  `Corresponding Group` (**Collection Object Name** each), `Show Interface`
+  (Bool False — no picker), `RMS Tolerance (0.0 for none)` / `Maximum
+  Absolute Tolerance (0.0 for none)` (Double), `Allow Scale` (Bool), and the
+  six DOF flags `Allow X` / `Allow Y` / `Allow Z` / `Allow Rx` / `Allow Ry` /
+  `Allow Rz` (Bool). out: `RMS Deviation` / `Maximum Absolute Deviation`
+  (Double) + `Transform in Working` (Transform → `get_transform_arg`,
+  `_matrix_variant` transport; see non-negotiable #3). Nothing new in the
+  bridge — this is the same call `sa_unify_groups`'s `fit` method already made;
+  it is now `_best_fit_group_transform(ref, corr, dofs=…, allow_scale=…,
+  rms_tolerance=…, max_abs_tolerance=…)`, with `_group_to_group_transform`
+  kept as the all-six-DOF wrapper unify uses. The tolerances only colour the
+  step's status; they do not change the solution.
+- **Direction** (live, deliberate +1 mm misalignment): `Transform in Working`
+  maps the CORRESPONDING group ONTO the REFERENCE — i.e. it is the delta to
+  ADD to the corresponding group. Confirmed again here: our recomputed RMS
+  over `p' = M·[x,y,z,1]` matched the step's own `RMS Deviation` to ~7
+  significant digits (0.144216835 vs 0.144216896), so the report is the same
+  estimator SA solved, not an approximation.
+- **A rigid fit cannot isolate one bad point.** Live on an 8-point box with a
+  single 0.5 mm bump (6 DOF, no scale): the bump is partly absorbed as a
+  rotation, so every inlier reads 0.057–0.147 mm and the planted point
+  0.336 mm — the worst by ~2.3×, not 0.5 vs 0. That pollution is the reason
+  to exclude it, and the honest way to phrase the expectation (a harness that
+  demands "inliers ~0, outlier 0.5" from a rigid fit is asserting a physical
+  impossibility).
+- **Deviation report is recomputed in Python** — the step returns only RMS +
+  Max Absolute. `_group_point_map` (per-target RAW working coords via
+  `_read_selected_point_records`) for BOTH groups, `_apply_matrix_to_point`
+  for each namesake pair, 3-D distance, sorted WORST FIRST (`deviations[0]` =
+  `worst_point`); `tolerance_mm` then flags `outliers` without excluding
+  anything. Pairs are matched BY NAME (the step's own rule): names in only one
+  group are reported under `unmatched_reference` / `unmatched_corresponding`
+  and take no part in the fit; no shared name at all is an error.
+- **Excluding points requires temp copies** — the step only takes whole
+  groups. `exclude_points` ⇒ `_FIT_TMP_REF` / `_FIT_TMP_CORR` are copied from
+  BOTH groups (in the reference's collection), the excluded targets are
+  `Delete Points`-ed from each copy, the fit runs on the COPIES (`refit: True`)
+  and the copies are deleted in a `finally`. `_prepare_fit_temp` verifies the
+  point count afterwards (`before - len(targets)`) because `Delete Points`
+  reports success for names it never found — without that check an ineffective
+  delete would silently refit WITH the excluded point. The sources are never
+  touched; excluded points keep their deviation under `excluded_deviations`
+  (`included: False` in the list) measured under the NEW transform. Live: with
+  target 4 excluded the inlier RMS went to exactly 0.0 and P4 kept 0.5.
+- **Apply + companions**: `apply=True` moves the corresponding group AND every
+  `move_objects` entry in ONE `Transform Objects by Delta (About Working
+  Frame)` (`_move_objects_by_matrix`) — the same step `sa_move_objects` uses, so
+  the delta is expressed in the ACTIVE working frame. The reference group is
+  refused with a reason under `move_objects_skipped` (it is the target of the
+  fit). Name frames/СК, fitted geometry and vector groups there so an assembly
+  travels together. `verify_after_move` (default) re-reads the moved group and
+  reports `stats_after_move` — computed over the same INCLUDED targets as
+  `stats`, so the two are directly comparable (an excluded point legitimately
+  stays off and must not be counted; counting it was a real live bug: the
+  verification read 0.2236 mm instead of ~0). Live: inliers landed on the
+  reference to 1e-14 mm and a companion 200+ mm away moved rigidly by the same
+  transform.
 
 **Show/Hide** (live): `Show Objects` / `Hide Objects` — in `Objects to
 Show` / `Objects to Hide` (Collection Object Name Ref List). (The PDF also
@@ -414,13 +708,26 @@ whole fit-quality chain (props readback, compensated deviations, outliers,
 radius read back exactly; side argument discriminates ~57× in RMS), view
 show/hide, deletion, frames/СК basics (frame on fitted plane + replace,
 activate + read-back + reset WORLD, two-point СК, point/object deletion),
-projection (`_live_proj.py` ALL OK), attach-first open, modal watchdog.
+move/transform (`_live_transform.py` ALL OK — matrix transport round-trip,
+translation, rotation about the active frame's origin, world mode with scale,
+frame-to-frame, pose read-back), projection (`_live_proj.py` ALL OK),
+best-fit transform МНК (`_live_fit_transform.py` ALL OK — our recomputed RMS
+matched the step's own to ~7 significant digits, exclude→refit collapsed the
+inlier RMS to 0.0 on the planted-outlier fixture, apply moved the group + a
+companion onto the reference),
+attach-first open, modal watchdog, group averaging (`_live_average.py` PASS —
+3 groups -> «Средняя», arithmetic mean exact to ~1e-13 mm), USMN unify
+(`sa_unify_groups`: `Locate Instruments (USMN)` with AutoReject solved the
+fixture's three groups -> 6-point composite, instruments auto-derived,
+colliding groups auto-excluded; `method="fit"` verified separately).
 PDF-named, NOT yet live: compare/vector-group trio + vector style
-(`_live_vectors.py` pending) and the frame/working-frame steps
-(`_live_frames_delete.py` pending). `sa_point_coordinates` is not yet
-exercised live. Compare min point counts per fit type: `_LIST_FIT_MIN_POINTS`
-(line 2 … cone 6).
-To extend: exports/reports, USMN, point/group manipulation beyond
-delete/construct — copy step names from the PDF / SDK examples and confirm
-live. Live check on a real job: `6.01.25 — обработка.xit` (collection "A",
-group «т контур» 376 pts).
+(`_live_vectors.py` pending). Compare min point counts per fit type:
+`_LIST_FIT_MIN_POINTS` (line 2 … cone 6).
+Still open on USMN: the `Show USMN Dialog` enum spellings (unused — the engine
+does not pop the dialog under SDK control) and step text messages (unreadable,
+see non-negotiable #7).
+To extend: exports/reports, a USMN run WITH real instrument movements /
+nominals (`sa_unify_groups` deliberately passes blank nominals and solves
+in-place), point/group manipulation beyond delete/construct/move — copy step
+names from the PDF / SDK examples and confirm live. Live check on a real job:
+`6.01.25 — обработка.xit` (collection "A", group «т контур» 376 pts).

@@ -14,7 +14,7 @@ import threading
 import uuid
 
 import pythoncom
-from win32com.client import Dispatch
+from win32com.client import Dispatch, VARIANT
 
 # ProgID of the SA SDK COM server. Registered when SpatialAnalyzer is installed.
 # Note: the .NET examples reference "SpatialAnalyzerSDKClass", but the COM
@@ -313,7 +313,28 @@ class SABridge:
         return self._submit(_invoke)
 
     def get_step_messages(self):
-        return self._call("GetMPStepMessages")
+        # GetMPStepMessages(VARIANT* vArray) -> BOOL, an [out] byref param per
+        # the C++ SDK header (CSpatialAnalyzerSDK.h) - which is exactly the
+        # shape the SA COM object cannot serve (no type library; see
+        # _invoke_method). Every transport was tried LIVE on SA 2015 and all
+        # fail: dynamic dispatch returns an empty/None result, and an explicit
+        # VT_VARIANT|VT_BYREF descriptor makes InvokeTypes raise 61704
+        # (COM internal application error). A step's text messages are
+        # therefore NOT readable on this build - sa_sdk deliberately swallows
+        # the error and returns [] so a tool still reports its own status
+        # instead of dying here. Kept as a call (not a bare `return []`) so a
+        # build that DOES answer it starts reporting text with no code change.
+        try:
+            res = self._invoke_method(
+                "GetMPStepMessages",
+                (pythoncom.VT_BOOL, 0),
+                ((pythoncom.VT_VARIANT | pythoncom.VT_BYREF, 0),),
+                None,
+            )
+            raw = res[-1] if isinstance(res, tuple) else res
+            return _variant_to_list(raw)
+        except Exception:  # noqa: BLE001 - unreadable on SA 2015, see above
+            return []
 
     # -- argument setters (typed) ------------------------------------------
     def set_string_arg(self, name: str, value: str):
@@ -342,6 +363,13 @@ class SABridge:
     def set_collection_object_name_arg(self, name, collection, object_name):
         return bool(
             self._call("SetCollectionObjectNameArg", name, collection, object_name)
+        )
+
+    def set_col_inst_id_arg(self, name, collection, inst_id):
+        # SetColInstIdArg(BSTR argName, BSTR collectionName, long instId) per
+        # the C++ SDK header - the instrument id is a LONG, not a name.
+        return bool(
+            self._call("SetColInstIdArg", name, collection, int(inst_id))
         )
 
     # -- argument getters (typed) ------------------------------------------
@@ -383,6 +411,69 @@ class SABridge:
                 raise SAError(f"Could not unwrap vector arg {name!r}: "
                               f"{res!r}") from exc
         return self._submit(_invoke)
+
+    # -- transform args (4x4 SAFEARRAY inside a VARIANT*) -------------------
+    # SA "Transform" / "World Transform Operator" arguments are VARIANT* whose
+    # value is a 2-D 4x4 SAFEARRAY of doubles (CSpatialAnalyzerSDK.h:
+    # SetTransformArg(name, VARIANT*), GetTransformArg(name, VARIANT*),
+    # SetWorldTransformArg(name, VARIANT*, double scale),
+    # GetWorldTransformArg(name, VARIANT*, double* scale)); the SDK's own
+    # SDKHelper::SetTransformArgHelper builds exactly that with
+    # Create(VT_R8, 2, {4,4}). Same no-type-library gotcha as the ref lists, so
+    # every call goes through IDispatch::Invoke with an explicit
+    # VT_VARIANT|VT_BYREF descriptor.
+    #
+    # The element type is what makes this different from a ref list: a ref list
+    # is a SAFEARRAY OF VARIANTS (plain Python list is right there), while a
+    # Transform is a SAFEARRAY OF R8 and SA re-reads the array's raw bytes as
+    # doubles - a VARIANT-element array comes back as garbage (element 0's
+    # vt header, 2.5e-323). pywin32 only builds a typed array when it is told
+    # the element type, which it takes from a win32com.client.VARIANT wrapper
+    # (PyCom_VariantFromPyObject -> ConvertPyVariant -> m_reqdType=VT_ARRAY|
+    # VT_R8). Wrap the matrix, never pass the bare list.
+    def set_transform_arg(self, name, matrix):
+        return bool(self._invoke_method(
+            "SetTransformArg",
+            (pythoncom.VT_BOOL, 0),
+            ((pythoncom.VT_BSTR, 0),
+             (pythoncom.VT_VARIANT | pythoncom.VT_BYREF, 0)),
+            name, _matrix_variant(matrix),
+        ))
+
+    def get_transform_arg(self, name):
+        res = self._invoke_method(
+            "GetTransformArg",
+            (pythoncom.VT_BOOL, 0),
+            ((pythoncom.VT_BSTR, 0),
+             (pythoncom.VT_VARIANT | pythoncom.VT_BYREF, 0)),
+            name, None,
+        )
+        raw = res[-1] if isinstance(res, tuple) else res
+        return _variant_to_matrix(raw)
+
+    def set_world_transform_arg(self, name, matrix, scale=1.0):
+        return bool(self._invoke_method(
+            "SetWorldTransformArg",
+            (pythoncom.VT_BOOL, 0),
+            ((pythoncom.VT_BSTR, 0),
+             (pythoncom.VT_VARIANT | pythoncom.VT_BYREF, 0),
+             (pythoncom.VT_R8, 0)),
+            name, _matrix_variant(matrix), float(scale),
+        ))
+
+    def get_world_transform_arg(self, name):
+        res = self._invoke_method(
+            "GetWorldTransformArg",
+            (pythoncom.VT_BOOL, 0),
+            ((pythoncom.VT_BSTR, 0),
+             (pythoncom.VT_VARIANT | pythoncom.VT_BYREF, 0),
+             (pythoncom.VT_R8 | pythoncom.VT_BYREF, 0)),
+            name, None, None,
+        )
+        vals = res if isinstance(res, tuple) else (res,)
+        matrix = _variant_to_matrix(vals[1]) if len(vals) > 1 else []
+        scale = float(vals[2]) if len(vals) > 2 else 1.0
+        return matrix, scale
 
     def get_point_name_arg(self, name: str):
         raw = self._call("GetPointNameArg", name)
@@ -505,6 +596,10 @@ class SABridge:
     def set_collection_name_arg(self, name, collection_name):
         return bool(self._call("SetCollectionNameArg", name, collection_name))
 
+    def get_collection_name_arg(self, name):
+        return str(self._get_scalar_out("GetCollectionNameArg", name,
+                                        pythoncom.VT_BSTR))
+
     def set_frame_name_arg(self, name, frame_name):
         return bool(self._call("SetFrameNameArg", name, frame_name))
 
@@ -538,6 +633,19 @@ class SABridge:
             (pythoncom.VT_BOOL, 0),
             ((pythoncom.VT_BSTR, 0), (pythoncom.VT_BSTR, 0)),
             name, object_type,
+        ))
+
+    def set_show_usmn_dialog_type_arg(self, name, show_type):
+        # Show USMN Dialog is an enum argument (always / never / only on
+        # tolerance violation) - same no-type-library gotcha as Object Type, so
+        # the value goes through IDispatch::Invoke with explicit VT_BSTR
+        # descriptors. The enum spellings are NOT documented in the MP
+        # reference; live-value pending.
+        return bool(self._invoke_method(
+            "SetShowUsmnDialogTypeArg",
+            (pythoncom.VT_BOOL, 0),
+            ((pythoncom.VT_BSTR, 0), (pythoncom.VT_BSTR, 0)),
+            name, show_type,
         ))
 
     def set_geometry_type_arg(self, name, geometry_type):
@@ -674,6 +782,19 @@ class SABridge:
             "SetCollectionObjectNameRefListArg", name, joined
         )
 
+    def set_col_inst_id_ref_list_arg(self, name, items):
+        # Collection Instrument ID Ref Lists transport exactly like Collection
+        # Object Name Ref Lists (the C++ helper SetColInstIdRefListArgHelper
+        # delegates to SetCollectionObjectNameRefListArgHelper), so one joined
+        # "Collection::InstrumentId" string per element - live: the getter
+        # returns e.g. ["A::0"].
+        return self._set_variant_list("SetColInstIdRefListArg", name,
+                                      [str(i) for i in items])
+
+    def get_col_inst_id_ref_list_arg(self, name):
+        flat = self._get_variant_list("GetColInstIdRefListArg", name)
+        return [str(x) for x in flat]
+
     def set_point_name_ref_list_arg(self, name, points):
         # points: one JOINED hierarchical full name per point ("C::G::T", or
         # "::G::T" for the current collection). The old (collection, group,
@@ -710,3 +831,54 @@ def _variant_to_list(raw) -> list:
         return list(raw)
     except TypeError:
         return [raw]
+
+
+def _matrix_to_nested(matrix):
+    """Normalize a 4x4 transform to a nested list-of-lists of floats.
+
+    pywin32 converts a nested Python sequence to a 2-D SAFEARRAY; a flat
+    16-element sequence is refused here so the caller cannot silently pass the
+    wrong layout (SA expects row-major 4x4, row = first dimension).
+    """
+    rows = []
+    try:
+        rows = [[float(v) for v in row] for row in matrix]
+    except (TypeError, ValueError) as exc:
+        raise SAError(f"A SA Transform must be a 4x4 matrix: {exc}") from exc
+    if len(rows) != 4 or any(len(r) != 4 for r in rows):
+        raise SAError(
+            f"A SA Transform must be a 4x4 matrix; got shape "
+            f"{[len(r) for r in rows]}.")
+    return rows
+
+
+def _matrix_variant(matrix):
+    """Wrap a 4x4 matrix as the typed VARIANT a SA Transform arg needs.
+
+    The VARIANT declares VT_ARRAY|VT_R8, which is the only thing that makes
+    pywin32 build a SAFEARRAY OF DOUBLES (a bare nested list yields a SAFEARRAY
+    OF VARIANTS and SA reads its bytes as doubles - garbage). SA's own
+    SDKHelper::SetTransformArgHelper builds the same VT_R8 2-D 4x4 array.
+    """
+    return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                   _matrix_to_nested(matrix))
+
+
+def _variant_to_matrix(raw):
+    """Convert a GetTransformArg VARIANT into a 4x4 list-of-lists of floats.
+
+    pywin32 returns the 2-D SAFEARRAY as nested tuples; a flat 16-element
+    sequence is reshaped row-major as a fallback.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)) and raw and \
+            isinstance(raw[0], (list, tuple)):
+        return [[float(v) for v in row] for row in raw]
+    try:
+        flat = [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return []
+    if len(flat) == 16:
+        return [flat[i * 4:(i + 1) * 4] for i in range(4)]
+    return [flat]

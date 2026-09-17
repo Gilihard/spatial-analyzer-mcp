@@ -4331,6 +4331,46 @@ def sa_identify_geometry(
 # ---------------------------------------------------------------------------
 
 
+def _fmt_num(v, decimals):
+    """Shortest decimal text of v with at most `decimals` fractional digits
+    (trailing zeros trimmed) - keeps the canvas compact for whole/clean
+    coordinates. Nonzero values below half the last kept digit fall back to
+    scientific notation instead of silently becoming 0."""
+    if v == 0:
+        return "0"
+    s = f"{v:.{decimals}f}".rstrip("0").rstrip(".")
+    if s in ("", "-0"):
+        s = "0"
+    if s == "0":
+        s = f"{v:.{decimals}e}"
+    return s
+
+
+def _point_canvas(records, include_offsets, decimals=6):
+    """Flatten point records into ONE token-lean CSV text: a header row plus
+    one x,y,z[,planar_offset,radial_offset] line per point, in record order.
+    Per-row offset columns are emitted only when they vary; when every point
+    carries the same planar/radial offset they are reported once via
+    `constant_offsets` and the canvas stays x,y,z only. Returns (canvas,
+    constant_offsets) where constant_offsets is None when offsets are absent
+    or per-row."""
+    if include_offsets and records:
+        p0, r0 = records[0]["planar_offset"], records[0]["radial_offset"]
+        const = all(r["planar_offset"] == p0 and r["radial_offset"] == r0
+                    for r in records)
+    else:
+        const = False
+    keys = ["x", "y", "z"]
+    if include_offsets and not const:
+        keys += ["planar_offset", "radial_offset"]
+    lines = [",".join(keys)]
+    for r in records:
+        lines.append(",".join(_fmt_num(r[k], decimals) for k in keys))
+    constant = ({"planar_offset": p0, "radial_offset": r0}
+                if include_offsets and const else None)
+    return "\n".join(lines), constant
+
+
 @mcp.tool()
 def sa_point_coordinates(
     point_group: str = "",
@@ -4339,24 +4379,37 @@ def sa_point_coordinates(
     group: str = "",
     include_offsets: bool = True,
     max_points: int | None = None,
+    format: str = "records",
+    decimals: int = 6,
 ) -> dict:
     """Read the working coordinates (+ stored probe/reflector offsets) of a point
     group or of individual points - a READ-ONLY export for direct analysis,
     nothing is created in SA.
-    Points come back in order: {name, full, x, y, z, planar_offset, radial_offset}
-    plus bounds {min, max, centroid} of what was returned and total_points /
-    truncated / unresolved. include_offsets=False skips the per-point offset step
-    (halves COM round trips; offset keys are 0.0); max_points caps a huge group
-    (truncated: True).
+    format='records' (default) returns the points in order:
+    {name, full, x, y, z, planar_offset, radial_offset}; format='canvas' is the
+    TOKEN-LEAN variant: it returns the same coordinates as ONE CSV text
+    'canvas' (header + one x,y,z[,planar_offset,radial_offset] line per point)
+    with nothing else repeated per point - no name/columns copies, bounds +
+    totals once. Per-row offset columns appear only when the offsets VARY;
+    when all points share one planar/radial offset (e.g. the same SMR radius)
+    the canvas stays x,y,z and the offsets are reported once under 'offsets'.
+    Numbers are trimmed to at most `decimals` fractional digits (default 6,
+    trailing zeros dropped; nonzero values below half the last kept digit use
+    scientific notation rather than rounding to 0).
+    Both formats add bounds {min, max, centroid} of what was returned and
+    total_points / truncated / unresolved. include_offsets=False skips the
+    per-point offset step (halves COM round trips; offsets are not read);
+    max_points caps a huge group (truncated: True).
     
     Source (exactly one): point_group (bare name in collection, or full 'C::G'),
     or points (full 'C::G::T', group-relative 'G::T', or bare with group; may
     span groups).
     
-    Args: point_group; collection; points; group; include_offsets; max_points.
+    Args: point_group; collection; points; group; include_offsets; max_points;
+    format; decimals.
     
     Returns {ok, source, count, total_points, truncated, offsets_read, bounds,
-             points, unresolved, error?}."""
+             points|canvas(+offsets?), unresolved, error?}."""
     try:
         _ensure_sa()
     except Exception as exc:  # noqa: BLE001
@@ -4368,6 +4421,12 @@ def sa_point_coordinates(
         return {"ok": False, "error": (
             "Provide a point source: 'point_group' (a whole group) or "
             "'points' (individual points).")}
+    if format not in ("records", "canvas"):
+        return {"ok": False, "error": (
+            "Unknown 'format': expected 'records' or 'canvas'.")}
+    if not 1 <= decimals <= 12:
+        return {"ok": False, "error": (
+            "'decimals' must be between 1 and 12.")}
 
     # Normalize the source into a list of joined full "C::G::T" names, then
     # read them all with the same helper the fit tools use.
@@ -4413,6 +4472,14 @@ def sa_point_coordinates(
         "max": [max(p[i] for p in pts) for i in range(3)],
         "centroid": [sum(p[i] for p in pts) / n for i in range(3)],
     }
+    if format == "canvas":
+        canvas, constant_offsets = _point_canvas(
+            records, include_offsets, decimals)
+        body = {"canvas": canvas}
+        if constant_offsets is not None:
+            body["offsets"] = constant_offsets
+    else:
+        body = {"points": records}
     return {
         "ok": True,
         "source": source,
@@ -4421,7 +4488,7 @@ def sa_point_coordinates(
         "truncated": n < total,
         "offsets_read": include_offsets,
         "bounds": bounds,
-        "points": records,
+        **body,
         "unresolved": unresolved,
         "error": None,
     }
@@ -4573,6 +4640,66 @@ def _co_name_parts(full_name):
     return "", s
 
 
+def _frame_full_names(collection):
+    """Full names of the frames currently in `collection` (best effort)."""
+    try:
+        return list(_objects_in_collection_by_type(collection, "Frame"))
+    except Exception:  # noqa: BLE001 - verification only, never fatal
+        return []
+
+
+def _active_collection():
+    """Name of SA's active (default) collection, or None ('Get Active
+    Collection Name'; always succeeds)."""
+    try:
+        sa.set_step("Get Active Collection Name")
+        sa.execute_step()
+        if sa.get_step_result() != 2:
+            return None
+        return sa.get_collection_name_arg("Currently Active Collection Name")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _activate_collection(collection, res):
+    """Make `collection` the active one for a step that has no collection arg.
+
+    Several Construction steps (all the Construct Frame variants) name the
+    result only; SA puts it in the ACTIVE collection, so a tool that accepts a
+    target collection has to switch. Returns the collection that was active
+    before (None = nothing to restore).
+    """
+    if not str(collection).strip():
+        return None
+    try:
+        prev = _active_collection()
+        res["active_collection_before"] = prev
+        if prev == collection:
+            return None
+        sa.set_step("Set (or construct) default collection")
+        sa.set_collection_name_arg("Collection Name", collection)
+        sa.execute_step()
+        res["status_code_active_collection"] = sa.get_step_result()
+        res["collection_activated"] = _active_collection() == collection
+        return prev
+    except Exception as exc:  # noqa: BLE001 - report, do not abort the caller
+        res["active_collection_error"] = str(exc)
+        return None
+
+
+def _restore_collection(previous, res):
+    """Put the active collection back after _activate_collection switched it."""
+    if not previous:
+        return
+    try:
+        sa.set_step("Set (or construct) default collection")
+        sa.set_collection_name_arg("Collection Name", previous)
+        sa.execute_step()
+        res["active_collection_after"] = _active_collection()
+    except Exception as exc:  # noqa: BLE001
+        res["active_collection_error"] = str(exc)
+
+
 @mcp.tool()
 def sa_create_frame(frame_name: str,
                     method: str = "",
@@ -4641,41 +4768,78 @@ def sa_create_frame(frame_name: str,
         res["error"] = str(exc)
         return res
 
+    # The optional result-name argument is NOT the same type in the two steps:
+    # the PDF types it Collection Object Name in 'Construct Frame On Object' but
+    # a plain Frame Name in the two-point step, and SA's setters each return
+    # True for a name they did not actually store (verified live). The wrong
+    # setter makes the step fail with SdkError -1 (on_object) or silently
+    # auto-names the frame (two-point), so the type is picked from the step.
+    if method == "on_object":
+        name_setter = sa.set_collection_object_name_arg
+        name_args = (collection, name)
+    else:
+        name_setter = sa.set_frame_name_arg
+        name_args = (name,)
+
     try:
-        if replace:
-            sa.set_step("Delete Objects")
-            sa.set_collection_object_name_ref_list_arg(
-                "Object Names", [full_name])
+        # Neither Construct Frame step takes a collection argument - the PDF
+        # says the frame lands in the ACTIVE collection. Activate the requested
+        # one for the duration of the step, then put the previous one back.
+        switched_from = _activate_collection(collection, res)
+        try:
+            # Enumerate BEFORE the step is armed: any other step that runs
+            # between the Set*Arg calls and ExecuteStep re-arms the engine's
+            # current step, and then ExecuteStep runs THAT step instead of this
+            # one (it "succeeds" having created nothing).
+            before = _frame_full_names(collection)
+            if replace:
+                sa.set_step("Delete Objects")
+                sa.set_collection_object_name_ref_list_arg(
+                    "Object Names", [full_name])
+                sa.execute_step()
+                if sa.get_step_result() in (2, 4):
+                    res["replaced"] = True
+            sa.set_step(step)
+            if method == "on_object":
+                coll, obj = _co_name_parts(
+                    _object_full_name(reference_object, collection))
+                sa.set_collection_object_name_arg("Reference Object", coll, obj)
+            else:
+                for arg_name, point in (("Origin Point", origin_point),
+                                        ("Point on X-Axis", point_on_x_axis)):
+                    coll, grp, target = _point_ref_parts(
+                        _point_full_name(point, group, collection))
+                    sa.set_point_name_arg(arg_name, coll, grp, target)
+            name_arg = _set_first_arg(name_setter, ["Frame Name (Optional)",
+                                                    "Frame Name"], *name_args)
+            if name_arg is None:
+                res["error"] = ("None of the frame-name arg candidates were "
+                                "accepted - check the step arg names.")
+                return res
             sa.execute_step()
-            if sa.get_step_result() in (2, 4):
-                res["replaced"] = True
-        sa.set_step(step)
-        if method == "on_object":
-            coll, obj = _co_name_parts(
-                _object_full_name(reference_object, collection))
-            sa.set_collection_object_name_arg("Reference Object", coll, obj)
-        else:
-            for arg_name, point in (("Origin Point", origin_point),
-                                    ("Point on X-Axis", point_on_x_axis)):
-                coll, grp, target = _point_ref_parts(
-                    _point_full_name(point, group, collection))
-                sa.set_point_name_arg(arg_name, coll, grp, target)
-        name_arg = _set_first_arg(
-            sa.set_collection_object_name_arg,
-            ["Frame Name (Optional)", "Frame Name"], collection, name)
-        if name_arg is None:
-            res["error"] = ("None of the frame-name arg candidates were "
-                            "accepted - check the step arg names.")
-            return res
-        sa.execute_step()
-        code = sa.get_step_result()
-        res["status_code"] = code
-        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
-        res["messages"] = _safe_messages()
-        res["created"] = code == 2
-        if code != 2:
-            res["error"] = (f"{step} returned {res['status']} (code {code}) "
-                            "- the frame was NOT created.")
+            code = sa.get_step_result()
+            res["status_code"] = code
+            res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+            res["messages"] = _safe_messages()
+            res["created"] = code == 2
+            if code == 2:
+                # Success is reported even when the name never reached the step
+                # (SA then auto-names the frame), so confirm by enumeration.
+                after = _frame_full_names(collection)
+                res["created_objects"] = [n for n in after if n not in before]
+                res["name_applied"] = any(
+                    n == full_name or str(n).endswith("::" + name)
+                    for n in after)
+                if not res["name_applied"]:
+                    res["warning"] = (
+                        "the frame was created but NOT under the requested "
+                        "name (SA auto-names a frame that got no name): it is "
+                        f"one of {res['created_objects'] or ['?']}")
+            if code != 2:
+                res["error"] = (f"{step} returned {res['status']} "
+                                f"(code {code}) - the frame was NOT created.")
+        finally:
+            _restore_collection(switched_from, res)
     except Exception as exc:  # noqa: BLE001
         res["error"] = str(exc)
     return res
@@ -4773,6 +4937,1268 @@ def sa_current_working_frame() -> dict:
     except Exception as exc:  # noqa: BLE001
         res["error"] = str(exc)
     return res
+
+
+# ---------------------------------------------------------------------------
+# Move objects (translation + rotation) relative to a coordinate system.
+#
+# GUI equivalent: Edit > Move Objects > Enter Transformation - "apply a
+# relative movement to an object by typing in values, expressed in the active
+# coordinate frame" (SA User Manual). Positional deltas are Cartesian XYZ;
+# rotational deltas are Fixed XYZ; both are relative to the ACTIVE (working)
+# frame, so to move relative to a particular СК activate it first
+# (sa_set_working_frame) or use a mode that names the frame explicitly.
+#
+# MP steps (MP Command Reference PDF, ch. 6 Analysis Operations; NOT yet
+# confirmed live on SA 2015 - see _live_transform.py):
+#   - 'Transform Objects by Delta (About Working Frame)' - in: Objects to
+#     Transform (Collection Object Name Ref List), Delta Transform (Transform
+#     in the active frame). The 6-DOF "Move Objects" dialog.
+#   - 'Transform Objects by Delta (World Transform Operator)' - in: Objects to
+#     Transform, Delta Transform (World Transform Operator = Transform +
+#     scale, expressed in WORLD).
+#   - 'Translate Objects by Delta' - in: Objects to Translate, Delta
+#     Translation (Vector, in the active frame). Pure 3-DOF translation.
+#   - 'Transform Objects - Frame To Frame' - in: Object Name List, Initial
+#     Frame Name, Destination Frame Name, Number of Steps (graphics only, 0 =
+#     instant). Moves objects by the 6-DOF delta from one frame's СК to
+#     another's.
+#   - 'Make a Transform from Doubles (Fixed XYZ)' - in: X/Y/Z, Rx (Roll)/Ry
+#     (Pitch)/Rz (Yaw); out: Resultant Transform. Used to compose the delta
+#     matrix so SA's own Fixed XYZ convention (rotation order, angle units) is
+#     used, never a Python re-implementation.
+#   - 'Get Working Transform of Object (Fixed XYZ)' - in: Object Name; out:
+#     Transform (the object's placement in the working frame).
+#   - 'Decompose Transform into Doubles (Fixed XYZ)' - in: Input Transform;
+#     out: X/Y/Z, Rx (Roll)/Ry (Pitch)/Rz (Yaw).
+#
+# A Transform arg is transported as a 4x4 SAFEARRAY inside a VARIANT - the
+# SABridge set_transform_arg/get_transform_arg/set_world_transform_arg
+# helpers handle that (see sa_sdk.py). All move steps are IN PLACE: to keep a
+# copy, copy the objects first (SA 'Copy Objects ...' - not exposed here).
+# ---------------------------------------------------------------------------
+
+_MOVE_MODES = ("about_working_frame", "world", "translate", "frame_to_frame")
+
+
+def _make_transform_fixed_xyz(x, y, z, rx, ry, rz):
+    """Compose a 4x4 Transform from Fixed XYZ doubles via SA's own MP step.
+
+    Returns (matrix, status_code, status, messages); matrix is [] when the
+    step did not succeed.
+    """
+    sa.set_step("Make a Transform from Doubles (Fixed XYZ)")
+    for arg, value in (("X", x), ("Y", y), ("Z", z),
+                       ("Rx (Roll)", rx), ("Ry (Pitch)", ry),
+                       ("Rz (Yaw)", rz)):
+        sa.set_double_arg(arg, float(value))
+    sa.execute_step()
+    code = sa.get_step_result()
+    messages = _safe_messages()
+    if code != 2:
+        return [], code, MP_STATUS.get(code, f"Unknown({code})"), messages
+    return sa.get_transform_arg("Resultant Transform"), code, "DoneSuccess", \
+        messages
+
+
+def _decompose_transform(matrix):
+    """Transform -> Fixed XYZ doubles ('Decompose Transform into Doubles')."""
+    sa.set_step("Decompose Transform into Doubles (Fixed XYZ)")
+    sa.set_transform_arg("Input Transform", matrix)
+    sa.execute_step()
+    if sa.get_step_result() != 2:
+        return None
+    return {
+        "x": sa.get_double_arg("X"),
+        "y": sa.get_double_arg("Y"),
+        "z": sa.get_double_arg("Z"),
+        "rx": sa.get_double_arg("Rx (Roll)"),
+        "ry": sa.get_double_arg("Ry (Pitch)"),
+        "rz": sa.get_double_arg("Rz (Yaw)"),
+    }
+
+
+def _object_transform(full_name):
+    """Read one object's placement in the working frame (matrix + Fixed XYZ).
+
+    Never raises: a per-object failure is reported inside the dict so a
+    read-back over many objects survives a point group that has no transform.
+    """
+    out = {"ok": False, "matrix": [], "fixed_xyz": None,
+           "status_code": None, "status": None}
+    try:
+        coll, obj = _co_name_parts(full_name)
+        sa.set_step("Get Working Transform of Object (Fixed XYZ)")
+        sa.set_collection_object_name_arg("Object Name", coll, obj)
+        sa.execute_step()
+        code = sa.get_step_result()
+        out["status_code"] = code
+        out["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        if code != 2:
+            return out
+        matrix = sa.get_transform_arg("Transform")
+        out["matrix"] = matrix
+        out["ok"] = True
+        if matrix:
+            out["fixed_xyz"] = _decompose_transform(matrix)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)
+    return out
+
+
+@mcp.tool()
+def sa_move_objects(
+        objects: list[str],
+        dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
+        rx: float = 0.0, ry: float = 0.0, rz: float = 0.0,
+        mode: str = "about_working_frame",
+        collection: str = "",
+        source_frame: str = "",
+        destination_frame: str = "",
+        scale: float = 1.0,
+        read_back: bool = True) -> dict:
+    """Move (transform) objects relative to a coordinate system - translation and
+    rotation - IN PLACE (no copy). The GUI equivalent is Edit > Move Objects >
+    Enter Transformation: positional deltas are Cartesian XYZ, rotational deltas
+    are Fixed XYZ (Rx roll / Ry pitch / Rz yaw, degrees), both expressed in the
+    ACTIVE working frame.
+    mode='about_working_frame' (default): 6-DOF delta in the active СК - the
+    combined dx/dy/dz + rx/ry/rz ('Transform Objects by Delta (About Working
+    Frame)'). Rotations are applied about the working frame origin, so activate
+    the target СК first with sa_set_working_frame to move relative to it.
+    mode='translate': pure translation dx/dy/dz in the active СК ('Translate
+    Objects by Delta'); rx/ry/rz must be 0.
+    mode='world': 6-DOF delta expressed in WORLD plus an optional `scale`
+    ('Transform Objects by Delta (World Transform Operator)').
+    mode='frame_to_frame': move objects by the 6-DOF delta between two named
+    frames ('Transform Objects - Frame To Frame'); requires `source_frame` and
+    `destination_frame`, ignores the numeric deltas.
+    The 4x4 delta matrix is composed by SA itself ('Make a Transform from
+    Doubles (Fixed XYZ)'), so its Fixed XYZ convention is used verbatim.
+    
+    Args: objects: full 'C::O' names or simple (in collection) - point groups,
+          geometry, vector groups, frames, ...; dx/dy/dz: translation (mm);
+          rx/ry/rz: Fixed XYZ rotation (degrees); mode: see above; collection;
+          source_frame/destination_frame: frame_to_frame only; scale: world mode
+          only (1.0 = rigid); read_back: read each object's working transform
+          before and after (2 extra COM round-trips per object).
+    
+    Returns {moved, step, mode, objects, delta, transform_matrix, transforms
+             (read_back), status_code, status, messages, error?}."""
+    obj_names = [_object_full_name(o, collection) for o in (objects or [])]
+    m = str(mode or "").strip().lower()
+    if m not in _MOVE_MODES:
+        m = "about_working_frame" if not m else m
+    delta = {"dx": float(dx), "dy": float(dy), "dz": float(dz),
+             "rx": float(rx), "ry": float(ry), "rz": float(rz),
+             "scale": float(scale)}
+    res = {"moved": False, "step": None, "mode": m, "objects": obj_names,
+           "collection": collection, "delta": delta, "transform_matrix": [],
+           "transforms": {}, "status_code": None, "status": None,
+           "messages": [], "error": None}
+    if not obj_names:
+        res["error"] = "objects is required: name at least one object to move."
+        return res
+    if m not in _MOVE_MODES:
+        res["error"] = (f"unknown mode '{mode}' (use one of "
+                        f"{', '.join(_MOVE_MODES)}).")
+        return res
+    if m == "translate" and any(abs(v) > 1e-12 for v in (rx, ry, rz)):
+        res["error"] = ("mode 'translate' applies translation only - rx/ry/rz "
+                        "must be 0. Use mode 'about_working_frame' for a "
+                        "combined translation + rotation.")
+        return res
+    if m == "frame_to_frame" and not (str(source_frame).strip()
+                                      and str(destination_frame).strip()):
+        res["error"] = ("mode 'frame_to_frame' requires both 'source_frame' "
+                        "and 'destination_frame'.")
+        return res
+
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+
+    try:
+        if read_back:
+            res["transforms"] = {
+                n: {"before": _object_transform(n)} for n in obj_names}
+
+        if m == "frame_to_frame":
+            res["step"] = "Transform Objects - Frame To Frame"
+            sc, so = _co_name_parts(_object_full_name(source_frame, collection))
+            dc, dob = _co_name_parts(
+                _object_full_name(destination_frame, collection))
+            sa.set_step(res["step"])
+            sa.set_collection_object_name_ref_list_arg(
+                "Object Name List", obj_names)
+            sa.set_collection_object_name_arg("Initial Frame Name", sc, so)
+            sa.set_collection_object_name_arg(
+                "Destination Frame Name", dc, dob)
+            sa.set_integer_arg("Number of Steps", 0)
+        elif m == "translate":
+            res["step"] = "Translate Objects by Delta"
+            sa.set_step(res["step"])
+            sa.set_collection_object_name_ref_list_arg(
+                "Objects to Translate", obj_names)
+            sa.set_vector_arg("Delta Translation", float(dx), float(dy),
+                              float(dz))
+        else:
+            res["step"] = ("Transform Objects by Delta (World Transform "
+                           "Operator)" if m == "world"
+                           else "Transform Objects by Delta (About Working "
+                                "Frame)")
+            matrix, mcode, mstatus, mmessages = _make_transform_fixed_xyz(
+                dx, dy, dz, rx, ry, rz)
+            res["messages"] += mmessages
+            if not matrix:
+                res["error"] = (f"'Make a Transform from Doubles (Fixed XYZ)' "
+                                f"returned {mstatus} (code {mcode}) - no "
+                                f"delta transform was built.")
+                return res
+            res["transform_matrix"] = matrix
+            sa.set_step(res["step"])
+            sa.set_collection_object_name_ref_list_arg(
+                "Objects to Transform", obj_names)
+            if m == "world":
+                sa.set_world_transform_arg("Delta Transform", matrix,
+                                           float(scale))
+            else:
+                sa.set_transform_arg("Delta Transform", matrix)
+
+        sa.execute_step()
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] += _safe_messages()
+        # code 4 = PARTIAL SUCCESS: at least one object was not found.
+        res["moved"] = code in (2, 4)
+        if code == 4:
+            res["objects_partial"] = ("PARTIAL SUCCESS: at least one of the "
+                                      "named objects was not found.")
+        if not res["moved"]:
+            res["error"] = (f"'{res['step']}' returned {res['status']} "
+                            f"(code {code}) - no object was moved.")
+
+        if read_back:
+            for n in obj_names:
+                res["transforms"][n]["after"] = _object_transform(n)
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = (f"{res['error']}; " if res["error"] else "") + str(exc)
+    return res
+
+
+@mcp.tool()
+def sa_object_transform(object: str, collection: str = "") -> dict:
+    """Read one object's placement in the ACTIVE working frame: the 4x4 transform
+    matrix plus its Fixed XYZ decomposition (position X/Y/Z and orientation
+    Rx/Ry/Rz). Steps: 'Get Working Transform of Object (Fixed XYZ)' +
+    'Decompose Transform into Doubles (Fixed XYZ)'. Use it to capture an
+    object's pose before/after sa_move_objects, or to read a frame's СК. Works
+    for objects that carry a transform (frames, fitted geometry, groups).
+    
+    Args: object: full 'C::O' name or simple (in collection); collection.
+    
+    Returns {ok, object, matrix, fixed_xyz {x,y,z,rx,ry,rz}, status_code,
+             status, error?}."""
+    full_name = _object_full_name(object, collection)
+    res = {"ok": False, "object": full_name, "collection": collection,
+           "matrix": [], "fixed_xyz": None, "status_code": None, "status": None,
+           "error": None}
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+    out = _object_transform(full_name)
+    res.update({k: out.get(k) for k in ("ok", "matrix", "fixed_xyz",
+                                        "status_code", "status")})
+    if "error" in out:
+        res["error"] = out["error"]
+    elif not out["ok"]:
+        res["error"] = (f"'Get Working Transform of Object (Fixed XYZ)' "
+                        f"returned {res['status']} (code "
+                        f"{res['status_code']}) - object not found?")
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Best-fit TRANSFORMATION of one point group onto another (МНК-совмещение).
+#
+# 'Best Fit Transformation - Group to Group' (MP Command Reference p.417) is
+# the LSQ estimator: it returns the 6-DOF transform that moves the
+# CORRESPONDING group onto the REFERENCE group, plus the fit's own RMS and Max
+# Absolute deviation. It carries per-DOF switches (Allow X..Rz), an optional
+# scale, and RMS/Max-Abs tolerances - but it does NOT report per-point
+# deviations and it can only fit WHOLE groups.
+#
+# Two consequences shape sa_best_fit_transform:
+#   1. Per-point deviations are recomputed HERE: apply the returned transform
+#      to every corresponding point and measure the 3-D distance to its
+#      reference namesake. That is the number a user needs to pick the bad
+#      point (they are sorted worst-first).
+#   2. Excluding points means fitting a SUBSET, which the step cannot take -
+#      so the excluded targets are deleted from temporary copies of BOTH
+#      groups and the step runs on the copies. Filtering both sides keeps the
+#      pairing unambiguous even if SA were to pair by index rather than by
+#      name. The copies are deleted in a `finally`, and the count after the
+#      delete is verified against the expected one - 'Delete Points' reports
+#      success even for names it did not find, so a silent no-op would
+#      otherwise make the "refit" identical to the unfiltered one.
+#
+# Alignment semantics (live-verified through sa_unify_groups' fit method): the
+# transform maps the corresponding group ONTO the reference group. Applying
+# it is a separate step ('Transform Objects by Delta (About Working Frame)',
+# the same one sa_move_objects/sa_unify_groups use), which is why `apply` also
+# takes `move_objects`: everything measured or built on the moving group (a
+# frame, fitted geometry, vector groups) must travel with it.
+# ---------------------------------------------------------------------------
+
+_FIT_TMP_REF = "MCP_FITTMP_REF"
+_FIT_TMP_CORR = "MCP_FITTMP_CORR"
+
+
+def _target_of(name):
+    """The target part of any point name form ('A::G::5' -> '5')."""
+    return str(name).rsplit("::", 1)[-1]
+
+
+def _group_point_map(group_full):
+    """{target: (x, y, z)} for every point of a point group.
+
+    RAW working coordinates - an alignment is a rigid fit of point POSITIONS,
+    so the stored reflector/probe offsets are deliberately not applied here
+    (they compensate a fit to a SURFACE, which is a different job; see
+    sa_fit_quality). One 'Get Point Coordinate' per point; a point whose
+    coordinate cannot be read lands in `unresolved` instead of killing the
+    whole read. Returns (map, unresolved).
+    """
+    rel = _points_in_group(group_full)
+    coll = group_full.split("::", 1)[0] if "::" in group_full else ""
+    fulls = [(f"{coll}::{r}" if coll else f"::{r}") for r in rel]
+    records, unresolved = _read_selected_point_records(fulls,
+                                                       include_offsets=False)
+    out = {}
+    for rec in records:
+        out[_target_of(rec["name"])] = (rec["x"], rec["y"], rec["z"])
+    return out, unresolved
+
+
+def _apply_matrix_to_point(matrix, xyz):
+    """p' = M . [x, y, z, 1] - row-major 4x4, translation in column 3."""
+    x, y, z = xyz
+    m = matrix
+    return (m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3],
+            m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3],
+            m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3])
+
+
+def _fit_temps_cleanup(temps):
+    """Delete the temp fit groups; never masks a result with its own error."""
+    if not temps:
+        return
+    try:
+        sa_delete(objects=list(temps))
+    except Exception:  # noqa: BLE001 - cleanup is best-effort
+        pass
+
+
+def _prepare_fit_temp(src_full, tmp_full, targets):
+    """Copy `src_full` to `tmp_full` and drop `targets`; verify the count.
+
+    Raises SAError when the copy or the point deletion did not do what the
+    caller is about to assume, so a failed exclusion can never masquerade as a
+    successful refit.
+    """
+    before = len(_points_in_group(src_full))
+    if _copy_object(src_full, tmp_full) not in (2, 4):
+        raise SAError(f"Could not copy '{src_full}' to '{tmp_full}'.")
+    coll, obj = _co_name_parts(tmp_full)
+    sa_delete(points=list(targets), group=obj, collection=coll)
+    after = len(_points_in_group(tmp_full))
+    if after != before - len(targets):
+        raise SAError(
+            f"Excluded points were not removed from the temp copy "
+            f"'{tmp_full}': {before} -> {after} points, expected "
+            f"{before - len(targets)} - the refit would have used the "
+            f"excluded points after all.")
+
+
+def _move_objects_by_matrix(obj_fulls, matrix):
+    """Apply a working-frame transform to a list of objects, IN PLACE."""
+    sa.set_step("Transform Objects by Delta (About Working Frame)")
+    sa.set_collection_object_name_ref_list_arg("Objects to Transform",
+                                               list(obj_fulls))
+    sa.set_transform_arg("Delta Transform", matrix)
+    sa.execute_step()
+    return sa.get_step_result()
+
+
+@mcp.tool()
+def sa_best_fit_transform(
+        reference_group: str,
+        corresponding_group: str,
+        collection: str = "",
+        exclude_points: list[str] | None = None,
+        tolerance_mm: float | None = None,
+        allow_scale: bool = False,
+        allow_x: bool = True,
+        allow_y: bool = True,
+        allow_z: bool = True,
+        allow_rx: bool = True,
+        allow_ry: bool = True,
+        allow_rz: bool = True,
+        rms_tolerance: float = 0.0,
+        max_abs_tolerance: float = 0.0,
+        apply: bool = False,
+        move_objects: list[str] | None = None,
+        include_deviations: bool = True,
+        max_deviations: int = 200,
+        verify_after_move: bool = True) -> dict:
+    """Best-fit (МНК) transform moving one point group ONTO another, with a
+    per-point deviation report - and optionally apply it.
+
+    Runs 'Best Fit Transformation - Group to Group': the returned transform
+    moves the CORRESPONDING group onto the REFERENCE group (corresponding
+    points are matched BY NAME; a name present in only one group is reported
+    under unmatched_reference / unmatched_corresponding and takes no part in
+    the fit). You choose which degrees of freedom the fit may use
+    (allow_x/y/z/rx/ry/rz) and whether scale is free (allow_scale); scale =
+    False keeps the fit rigid (6-DOF). rms_tolerance / max_abs_tolerance are
+    the step's own accept limits (0.0 = none) - they only colour the status,
+    they do not change the solution.
+    Deviations: the step reports RMS and Max Absolute only, so EVERY point's
+    deviation is recomputed here - the returned transform is applied to each
+    corresponding point and compared with its reference namesake (3-D
+    distance, unsigned). The list is sorted WORST FIRST, so deviations[0] /
+    worst_point is the point to look at; `tolerance_mm` flags the ones beyond
+    it under outliers without excluding anything.
+    Excluding a bad point and recomputing: pass its name under
+    `exclude_points` (full 'A::G::5', group-relative 'G::5' or bare '5') and
+    call again with the same arguments plus the growth list. The step can only
+    fit whole groups, so the excluded targets are deleted from temporary
+    copies of BOTH groups, the fit is re-run on the copies (refit: True) and
+    the copies are removed again. Excluded points keep their deviation in the
+    report (`excluded_deviations`, and `included: False` in the list) - that
+    is how much worse the point was, measured under the NEW transform.
+    Moving: apply=True moves the corresponding group AND everything named in
+    `move_objects` in one 'Transform Objects by Delta (About Working Frame)'
+    (the same step sa_move_objects uses). Name there whatever was built on the
+    moving group - frames/СК, fitted geometry, vector groups - so the assembly
+    travels together; the reference group is never moved (it is skipped and
+    reported under move_objects_skipped). verify_after_move re-reads the moved
+    group and reports stats_after_move - the honest check that it landed,
+    measured over the same INCLUDED points as `stats` so the two are directly
+    comparable (an excluded point stays out of both).
+
+    Args: reference_group: the group to fit TO (stays put); corresponding_group:
+    the group to fit/move; collection: resolves bare names ('' = current);
+    exclude_points: target names to drop and refit without; tolerance_mm:
+    outlier flag threshold (None = no flags); allow_scale/allow_x..allow_rz:
+    fit freedoms; rms_tolerance/max_abs_tolerance: step accept limits (0.0);
+    apply: perform the move; move_objects: extra objects moved with the group;
+    include_deviations/max_deviations: report size (worst-first cap);
+    verify_after_move: re-read the moved group.
+
+    Returns {computed, step, reference_group, corresponding_group, collection,
+             direction, dofs, allow_scale, matrix, fixed_xyz, sa_stats {rms_
+             deviation, max_absolute_deviation}, stats, pairs,
+             unmatched_reference, unmatched_corresponding, excluded,
+             excluded_unknown, excluded_deviations, refit, deviations,
+             deviations_truncated, outliers, worst_point, temp_objects,
+             applied, moved_objects, move_objects_skipped, move_status_code,
+             move_status, stats_after_move, status_code, status, messages,
+             error?}."""
+    ref_full = _object_full_name(reference_group, collection)
+    corr_full = _object_full_name(corresponding_group, collection)
+    dofs = [d for d, on in zip(_FIT_DOF_ARGS,
+                               (allow_x, allow_y, allow_z, allow_rx, allow_ry,
+                                allow_rz)) if on]
+    res = {
+        "computed": False,
+        "step": "Best Fit Transformation - Group to Group",
+        "reference_group": ref_full,
+        "corresponding_group": corr_full,
+        "collection": collection,
+        "direction": ("the transform maps the CORRESPONDING group ONTO the "
+                      "REFERENCE group (apply it to the corresponding group)"),
+        "dofs": dofs,
+        "allow_scale": bool(allow_scale),
+        "matrix": [],
+        "fixed_xyz": None,
+        "sa_stats": {"rms_deviation": None, "max_absolute_deviation": None},
+        "stats": None,
+        "pairs": 0,
+        "unmatched_reference": [],
+        "unmatched_corresponding": [],
+        "excluded": [],
+        "excluded_unknown": [],
+        "excluded_deviations": {},
+        "refit": False,
+        "deviations": [],
+        "deviations_truncated": False,
+        "outliers": [],
+        "worst_point": None,
+        "temp_objects": [],
+        "applied": False,
+        "moved_objects": [],
+        "move_objects_skipped": [],
+        "move_status_code": None,
+        "move_status": None,
+        "stats_after_move": None,
+        "status_code": None,
+        "status": None,
+        "messages": [],
+        "error": None,
+    }
+    if not str(reference_group or "").strip() or \
+            not str(corresponding_group or "").strip():
+        res["error"] = ("Both 'reference_group' and 'corresponding_group' are "
+                        "required.")
+        return res
+    if not dofs:
+        res["error"] = ("No degree of freedom is allowed - enable at least "
+                        "one of allow_x/y/z/rx/ry/rz (or allow_scale).")
+        return res
+    if int(max_deviations) < 0:
+        res["error"] = "'max_deviations' must be >= 0."
+        return res
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+
+    temps = []
+    try:
+        ref_map, ref_unres = _group_point_map(ref_full)
+        corr_map, corr_unres = _group_point_map(corr_full)
+        if not ref_map:
+            res["error"] = (f"No readable points in reference group "
+                            f"'{ref_full}'.")
+            return res
+        if not corr_map:
+            res["error"] = (f"No readable points in corresponding group "
+                            f"'{corr_full}'.")
+            return res
+        res["unmatched_reference"] = sorted(set(ref_map) - set(corr_map))
+        res["unmatched_corresponding"] = sorted(set(corr_map) - set(ref_map))
+        targets = sorted(set(ref_map) & set(corr_map))
+        res["pairs"] = len(targets)
+        if not targets:
+            res["error"] = ("The two groups share no point names - the "
+                            "'Group to Group' fit matches corresponding "
+                            "points BY NAME.")
+            return res
+
+        excluded, unknown = [], []
+        for raw in (exclude_points or []):
+            target = _target_of(raw)
+            if target in targets:
+                if target not in excluded:
+                    excluded.append(target)
+            else:
+                unknown.append(str(raw))
+        res["excluded"] = excluded
+        res["excluded_unknown"] = unknown
+        if len(excluded) >= len(targets):
+            res["error"] = ("Every matching point is excluded - nothing is "
+                            "left to fit.")
+            return res
+
+        ref_fit, corr_fit = ref_full, corr_full
+        if excluded:
+            ref_coll = _co_name_parts(ref_full)[0]
+
+            def _temp(prefix):
+                return f"{ref_coll}::{prefix}" if ref_coll else f"::{prefix}"
+
+            ref_fit, corr_fit = _temp(_FIT_TMP_REF), _temp(_FIT_TMP_CORR)
+            temps = [ref_fit, corr_fit]
+            res["temp_objects"] = list(temps)
+            res["refit"] = True
+            _fit_temps_cleanup(temps)
+            _prepare_fit_temp(ref_full, ref_fit, excluded)
+            _prepare_fit_temp(corr_full, corr_fit, excluded)
+
+        code, sa_rms, sa_max, matrix = _best_fit_group_transform(
+            ref_fit, corr_fit, dofs=dofs, allow_scale=allow_scale,
+            rms_tolerance=rms_tolerance,
+            max_abs_tolerance=max_abs_tolerance)
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] += _safe_messages()
+        res["sa_stats"] = {"rms_deviation": sa_rms,
+                           "max_absolute_deviation": sa_max}
+        if code not in (2, 4) or not matrix:
+            res["error"] = (f"'Best Fit Transformation - Group to Group' "
+                            f"returned {res['status']} (code {code}) - no "
+                            f"transform was computed.")
+            return res
+        res["matrix"] = matrix
+        res["fixed_xyz"] = _decompose_transform(matrix)
+        res["computed"] = True
+
+        deviations = []
+        for target in targets:
+            rx, ry, rz = ref_map[target]
+            cx, cy, cz = corr_map[target]
+            mx, my, mz = _apply_matrix_to_point(matrix, (cx, cy, cz))
+            dev = math.sqrt((mx - rx) ** 2 + (my - ry) ** 2 + (mz - rz) ** 2)
+            deviations.append({
+                "target": target,
+                "reference": [round(rx, 6), round(ry, 6), round(rz, 6)],
+                "corresponding": [round(cx, 6), round(cy, 6), round(cz, 6)],
+                "deviation": round(dev, 6),
+                "included": target not in excluded,
+                "outlier": bool(tolerance_mm is not None
+                                and dev > float(tolerance_mm)),
+            })
+        deviations.sort(key=lambda d: d["deviation"], reverse=True)
+        included = [d for d in deviations if d["included"]]
+        res["stats"] = _dev_stats(included)
+        res["outliers"] = [d["target"] for d in included if d["outlier"]]
+        res["worst_point"] = deviations[0] if deviations else None
+        res["excluded_deviations"] = {d["target"]: d["deviation"]
+                                      for d in deviations if not d["included"]}
+        if include_deviations:
+            cap = int(max_deviations)
+            res["deviations"] = deviations[:cap] if cap else []
+            res["deviations_truncated"] = len(deviations) > len(res["deviations"])
+
+        if apply:
+            for name in (move_objects or []):
+                full = _object_full_name(name, collection)
+                if full == ref_full:
+                    res["move_objects_skipped"].append(
+                        {"object": full, "reason": "the reference group is "
+                                                   "the target of the fit - "
+                                                   "it is not moved"})
+                elif full not in res["moved_objects"]:
+                    res["moved_objects"].append(full)
+            if corr_full not in res["moved_objects"]:
+                res["moved_objects"].insert(0, corr_full)
+            mcode = _move_objects_by_matrix(res["moved_objects"], matrix)
+            res["move_status_code"] = mcode
+            res["move_status"] = MP_STATUS.get(mcode, f"Unknown({mcode})")
+            res["messages"] += _safe_messages()
+            res["applied"] = mcode in (2, 4)
+            if mcode == 4:
+                res["objects_partial"] = ("PARTIAL SUCCESS: at least one of "
+                                          "the named objects was not found.")
+            if not res["applied"]:
+                res["error"] = (f"'Transform Objects by Delta (About Working "
+                                f"Frame)' returned {res['move_status']} "
+                                f"(code {mcode}) - nothing was moved.")
+            elif verify_after_move:
+                moved_map, _ = _group_point_map(corr_full)
+                after = []
+                for target in targets:
+                    if target in excluded or target not in moved_map:
+                        continue
+                    rx, ry, rz = ref_map[target]
+                    mx, my, mz = moved_map[target]
+                    after.append({"deviation": math.sqrt(
+                        (mx - rx) ** 2 + (my - ry) ** 2 + (mz - rz) ** 2)})
+                res["stats_after_move"] = _dev_stats(after)
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = (f"{res['error']}; " if res["error"] else "") + str(exc)
+    finally:
+        _fit_temps_cleanup(temps)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Group averaging ('Average a set of Groups').
+#
+# The USMN step ('Locate Instruments (USMN)') is a NETWORK tool: it takes a
+# Collection Instrument ID Ref List, needs instrument enumeration (SA 2015 has
+# no "list all instruments" step), a nominals group and the Show-USMN-Dialog
+# enum. For the common "average several measured groups of the same targets"
+# job SA has a dedicated CONSTRUCTION step that needs none of that:
+#   - 'Average a set of Groups' - in: Group Names (Collection Object Name Ref
+#     List), Resulting Group Name (Collection Object Name), RMS Tolerance /
+#     Maximum Absolute Tolerance / Maximum Average Tolerance (Double, 0.0 for
+#     none); out: RMS Deviation, Max Absolute Deviation, Average Deviation
+#     (Double). "Points with matching names from different groups are
+#     averaged"; the averaged points inherit the source point names.
+# Transport is the same as 'Delete Objects' / the fit steps (Collection Object
+# Name Ref List + Collection Object Name + Doubles), all live-proven - no new
+# bridge helper is involved. Step/arg names are PDF (p.181), like the
+# vector-group trio.
+# The statuses are NOT a reliable success signal (PARTIAL SUCCESS = "averaged,
+# but a tolerance failed"; FAILURE is documented as BOTH "no source group was
+# found" and "a tolerance failed"), so success is decided by what the result
+# group actually contains - the same rule as the projection/compare tools.
+# LIVE-CONFIRMED 2026-09-10 on "6.01.25 — обработка.xit": "Опорная сеть" (6
+# pts), "LocateInstMeas1" (6), "LocateInstMeas1*" (5) -> "Средняя" (6 pts),
+# status DoneSuccess. Matching IS by target name across groups (a target absent
+# from a group is averaged over the groups that have it; target 5 came from 2,
+# the rest from 3), the result inherits the source target names, and every
+# coordinate equals the plain ARITHMETIC mean to ~1e-13 mm (verified against an
+# independently computed Python mean in _live_average.py). The three returned
+# deviations are the WORST POINT's RMS / mean / max distance - not whole-merge
+# aggregates (SA's RMS equalled the per-target RMS of the worst target exactly).
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def sa_average_groups(
+    source_groups: list[str],
+    result_group: str,
+    collection: str = "",
+    rms_tolerance: float = 0.0,
+    max_abs_tolerance: float = 0.0,
+    max_average_tolerance: float = 0.0,
+    delete_existing: bool = True,
+) -> dict:
+    """Average several point groups into one group - the "USMN as an averager"
+    job, without instruments, network solving or any movement ('Average a set
+    of Groups').
+    Points with MATCHING NAMES from different groups are averaged (the match is
+    on the target name; the group prefix is ignored), and the averaged points
+    INHERIT the source names, so the result holds one point per distinct target
+    name. A target present in only some of the groups is averaged over just
+    those groups. Sources may live in different collections; `collection`
+    resolves bare names and receives the result group ('' = active collection).
+    A same-named result group is deleted first when delete_existing=True (SA
+    never overwrites - it would silently suffix the name), reported under
+    `replaced`. Success is decided by what the result group actually contains
+    (`result_count`), NOT by the status code: the step documents PARTIAL
+    SUCCESS for "averaged, but a tolerance failed" and FAILURE for both "no
+    source group was found" and "a tolerance failed". Tolerances are 0.0 = no
+    limit; the actual deviations are returned either way.
+    NOTE (live, SA 2015): the three returned deviations are NOT network-wide
+    aggregates - each is the WORST POINT's statistic (that point's RMS / mean /
+    maximum distance to its own averaged point), so `stats` describes the worst
+    target, not the whole merge. The tolerances are judged on the same
+    worst-point values (a single bad point trips the step). The averaged
+    coordinates themselves are a plain ARITHMETIC mean (live-verified to
+    ~1e-13 mm against a Python mean).
+
+    Args: source_groups: two or more point groups (full 'A::G' or bare names
+          resolved in `collection`); result_group: name of the averaged group;
+          collection: collection of the sources and the result ('' = active);
+          rms_tolerance / max_abs_tolerance / max_average_tolerance: 0.0 = no
+          limit; delete_existing: replace a same-named result group.
+
+    Returns {averaged, result_group, source_groups, result_count, stats {rms,
+             max_absolute, average}, replaced, status_code, status, messages,
+             error?}."""
+    src_full = [_object_full_name(g, collection) for g in (source_groups or [])]
+    res_full = _object_full_name(result_group, collection)
+    res = {
+        "averaged": False,
+        "step": "Average a set of Groups",
+        "result_group": res_full,
+        "source_groups": src_full,
+        "result_count": 0,
+        "stats": {"rms": None, "max_absolute": None, "average": None},
+        "replaced": False,
+        "status_code": None,
+        "status": None,
+        "messages": [],
+        "error": None,
+    }
+    if not result_group:
+        res["error"] = "result_group is required."
+        return res
+    if len(src_full) < 2:
+        res["error"] = ("At least two source groups are required - averaging a "
+                        "single group only copies it.")
+        return res
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+
+    if delete_existing:
+        d = sa_delete(objects=[res_full])
+        res["replaced"] = bool(d.get("objects_deleted"))
+        if d.get("error"):
+            res["messages"].append(f"delete-before-create: {d['error']}")
+
+    try:
+        sa.set_step("Average a set of Groups")
+        sa.set_collection_object_name_ref_list_arg("Group Names", src_full)
+        coll, bare = (res_full.split("::", 1) if "::" in res_full
+                      else ("", res_full))
+        sa.set_collection_object_name_arg("Resulting Group Name", coll, bare)
+        sa.set_double_arg("RMS Tolerance (0.0 for none)", rms_tolerance)
+        sa.set_double_arg("Maximum Absolute Tolerance (0.0 for none)",
+                          max_abs_tolerance)
+        sa.set_double_arg("Maximum Average Tolerance (0.0 for none)",
+                          max_average_tolerance)
+        sa.execute_step()
+        code = sa.get_step_result()
+        res["status_code"] = code
+        res["status"] = MP_STATUS.get(code, f"Unknown({code})")
+        res["messages"] += _safe_messages()
+        for key, arg in (("rms", "RMS Deviation"),
+                         ("max_absolute", "Max Absolute Deviation"),
+                         ("average", "Average Deviation")):
+            try:
+                res["stats"][key] = sa.get_double_arg(arg)
+            except Exception:  # noqa: BLE001 - not every build exposes it
+                pass
+        created = _points_in_group(res_full)
+        res["result_count"] = len(created)
+        res["averaged"] = res["result_count"] > 0
+        if not res["averaged"]:
+            res["error"] = (
+                f"'{res['step']}' returned {res['status']} (code {code}) and no "
+                f"group '{res_full}' was created - check the source group names "
+                f"(a bare name resolves in the active collection).")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Group unification: LSQ-align the sources, then merge them.
+#
+# 'Average a set of Groups' only averages - it does NOT register the groups.
+# The two SA-native ways to add the least-squares alignment:
+#
+#   method="usmn" - 'Locate Instruments (USMN)'. Built from the source groups
+#   the instruments that observed them ('Get Instruments with Observations on
+#   Target'), fed as a Collection Instrument ID Ref List; the step solves the
+#   network AND writes the composite (averaged) group. Its 'AutoReject Outliers
+#   and Resolve' is the iterative auto-rejection ("авторасчёт") - pass
+#   auto_reject=True. Live lessons (2026-09-10, "6.01.25 — обработка.xit"):
+#     * USMN matches targets BY NAME and works off the WHOLE job's observations,
+#       not just the named groups. If another group measured by the SAME
+#       instrument reuses a target name (there "т контур", 376 points named
+#       1..376, collides with "Опорная сеть"'s names 1..6, both instrument 0),
+#       the network is ambiguous and the step returns FAILURE (code 3) with NO
+#       message. That is what 'Groups to be Excluded' is for -> the default
+#       `exclude_other_groups=True` excludes every other point group of the
+#       collection, which is what made 0+2+3 solve (6 composite targets,
+#       RMS 0.0112 mm).
+#     * The solve is NOT deterministic: the same arguments can return code 3 on
+#       one attempt and DoneSuccess on the next (and a "success" whose reported
+#       RMS is exactly 0.0 is a degenerate no-op result, not a fit). So the tool
+#       RETRIES up to max_attempts and only accepts a code-2 attempt that
+#       actually produced points.
+#     * 'Show USMN Dialog' is left at the step default - the enum spellings are
+#       undocumented (a wrong one is silently ignored by the setter, which
+#       returns True for anything) and the engine does not pop the dialog under
+#       SDK control.
+#     * The nominals group is left blank: passing a measured group as nominals
+#       drove the fit into FAILURE.
+#
+#   method="fit" - the explicit pipeline, for when USMN cannot solve (e.g. the
+#   instruments have no shared targets): COPY every source group, LSQ-fit each
+#   copy onto the reference copy ('Best Fit Transformation - Group to Group',
+#   which returns the transform mapping the CORRESPONDING group ONTO the
+#   REFERENCE group), apply it ('Transform Objects by Delta (About Working
+#   Frame)'), then 'Average a set of Groups' over the aligned copies. The
+#   sources are never modified; the temporary copies are deleted afterwards.
+#   Live-verified direction: a copy shifted +1 mm in X produced a fitted
+#   translation of -1.000000037 mm and re-fit at the original RMS.
+#   NOTE: on a job whose instruments are already located the groups share one
+#   frame, so the fitted transform is the identity and "fit" reproduces the
+#   plain average (verified to 0.000000 mm on the fixture).
+# ---------------------------------------------------------------------------
+_UNIFY_METHODS = ("usmn", "fit")
+
+
+def _instruments_on_group(group_full_name, limit=10):
+    """Union of instruments that observed the group's first `limit` points."""
+    coll, group = _co_name_parts(group_full_name)
+    out = []
+    for point in _points_in_group(group_full_name)[:limit]:
+        target = point.rsplit("::", 1)[-1]
+        sa.set_step("Get Instruments with Observations on Target")
+        sa.set_point_name_arg("Point Name", coll, group, target)
+        sa.execute_step()
+        if sa.get_step_result() != 2:
+            continue
+        for inst in sa.get_col_inst_id_ref_list_arg(
+                "Resultant Collection Instrument Reference List"):
+            if inst not in out:
+                out.append(inst)
+    return out
+
+
+def _copy_object(src_full, dst_full, overwrite=True):
+    sc, so = _co_name_parts(src_full)
+    dc, dob = _co_name_parts(dst_full)
+    sa.set_step("Copy Object")
+    sa.set_collection_object_name_arg("Source Object", sc, so)
+    sa.set_collection_object_name_arg("New Object Name", dc, dob)
+    sa.set_bool_arg("Overwrite If Exists?", bool(overwrite))
+    sa.execute_step()
+    return sa.get_step_result()
+
+
+_FIT_DOF_ARGS = ("Allow X", "Allow Y", "Allow Z", "Allow Rx", "Allow Ry",
+                 "Allow Rz")
+
+
+def _best_fit_group_transform(ref_full, corr_full, dofs=None,
+                              allow_scale=False, rms_tolerance=0.0,
+                              max_abs_tolerance=0.0):
+    """LSQ transform mapping `corr_full` ONTO `ref_full` - the МНК fit.
+
+    One 'Best Fit Transformation - Group to Group' run. Returns
+    (status_code, rms, max_absolute, matrix); on a failed step rms/max come
+    back None and matrix [] - the out-arg getters are skipped rather than
+    reading values SA never wrote. Direction is live-verified: the transform
+    is the delta to ADD to the corresponding group to land it on the
+    reference group. `dofs` is any subset of _FIT_DOF_ARGS (None = all six);
+    `allow_scale` keeps the fit rigid when False.
+    """
+    rc, ro = _co_name_parts(ref_full)
+    cc, co = _co_name_parts(corr_full)
+    allowed = set(_FIT_DOF_ARGS if dofs is None else dofs)
+    sa.set_step("Best Fit Transformation - Group to Group")
+    sa.set_collection_object_name_arg("Reference Group", rc, ro)
+    sa.set_collection_object_name_arg("Corresponding Group", cc, co)
+    sa.set_bool_arg("Show Interface", False)
+    sa.set_double_arg("RMS Tolerance (0.0 for none)", float(rms_tolerance))
+    sa.set_double_arg("Maximum Absolute Tolerance (0.0 for none)",
+                      float(max_abs_tolerance))
+    sa.set_bool_arg("Allow Scale", bool(allow_scale))
+    for dof in _FIT_DOF_ARGS:
+        sa.set_bool_arg(dof, dof in allowed)
+    sa.execute_step()
+    code = sa.get_step_result()
+    if code not in (2, 4):
+        return code, None, None, []
+    return (code, sa.get_double_arg("RMS Deviation"),
+            sa.get_double_arg("Maximum Absolute Deviation"),
+            sa.get_transform_arg("Transform in Working"))
+
+
+def _group_to_group_transform(ref_full, corr_full):
+    """sa_unify_groups' fit method: all six DOF, rigid, no tolerances."""
+    return _best_fit_group_transform(ref_full, corr_full)
+
+
+def _apply_delta_transform(obj_full, matrix):
+    sa.set_step("Transform Objects by Delta (About Working Frame)")
+    sa.set_collection_object_name_ref_list_arg("Objects to Transform",
+                                               [obj_full])
+    sa.set_transform_arg("Delta Transform", matrix)
+    sa.execute_step()
+    return sa.get_step_result()
+
+
+def _group_agreement(src_full, res_full):
+    """Per-source agreement with the merged group, matched by target name.
+
+    A deterministic quality number, computed here instead of trusting the step:
+    USMN's own 'RMS Error Value' comes back as an exact 0.0 on some runs of a
+    perfectly good solve, while the composite group is identical. Returns
+    {overall {rms, max_absolute, pairs}, by_group {group: {...}}} of the 3-D
+    distance from each source point to its merged counterpart (points whose
+    name is absent from the result are counted under `unmatched`).
+    """
+    merged = {}
+    out = sa_point_coordinates(res_full, include_offsets=False)
+    for point in out.get("points", []):
+        merged[point["name"].rsplit("::", 1)[-1]] = (point["x"], point["y"],
+                                                     point["z"])
+    stats = {"overall": {"rms": None, "max_absolute": None, "pairs": 0},
+             "by_group": {}}
+    all_d = []
+    for group in src_full:
+        got = sa_point_coordinates(group, include_offsets=False)
+        distances = []
+        unmatched = 0
+        for point in got.get("points", []):
+            name = point["name"].rsplit("::", 1)[-1]
+            if name not in merged:
+                unmatched += 1
+                continue
+            mx, my, mz = merged[name]
+            distances.append(((point["x"] - mx) ** 2 +
+                              (point["y"] - my) ** 2 +
+                              (point["z"] - mz) ** 2) ** 0.5)
+        entry = {"points": len(got.get("points", [])), "matched": len(distances),
+                 "unmatched": unmatched, "rms": None, "max_absolute": None}
+        if distances:
+            entry["rms"] = (sum(d * d for d in distances) / len(distances)) ** 0.5
+            entry["max_absolute"] = max(distances)
+            all_d += distances
+        stats["by_group"][group] = entry
+    if all_d:
+        stats["overall"] = {
+            "rms": (sum(d * d for d in all_d) / len(all_d)) ** 0.5,
+            "max_absolute": max(all_d),
+            "pairs": len(all_d),
+        }
+    return stats
+
+
+@mcp.tool()
+def sa_unify_groups(
+    source_groups: list[str],
+    result_group: str,
+    method: str = "usmn",
+    auto_reject: bool = True,
+    instruments: list[str] | None = None,
+    reference_group: str = "",
+    exclude_other_groups: bool = True,
+    exclude_single_observation: bool = False,
+    rms_tolerance: float = 0.0,
+    max_tolerance: float = 0.0,
+    max_attempts: int = 4,
+    collection: str = "",
+    delete_existing: bool = True,
+) -> dict:
+    """Unify several point groups: LSQ-align them, then merge them into one
+    averaged group - USMN-style ("усреднение с совмещением по МНК").
+    method="usmn" (default) runs the SA network step 'Locate Instruments (USMN)'
+    on the instruments that measured the source groups; its
+    'AutoReject Outliers and Resolve' (auto_reject=True) is the iterative
+    auto-rejection of bad points, and the step writes the composite group.
+    method="fit" is the explicit fallback (copy each source, best-fit it onto
+    the reference, average the aligned copies) for when the network cannot be
+    solved - e.g. the instruments have no shared targets. The source groups are
+    NEVER modified either way.
+    USMN caveat (live): it matches targets BY NAME across the whole job, so a
+    different group measured by the same instrument that reuses a target name
+    makes the solve ambiguous and it fails with status FAILURE and no message.
+    `exclude_other_groups=True` (default) therefore passes every other point
+    group of the collection as 'Groups to be Excluded'. The first attempt
+    frequently fails outright, so the tool retries up to `max_attempts` and
+    accepts only a run that really produced points. USMN's own 'RMS Error Value'
+    comes back as an exact 0.0 on some runs of a perfectly good solve, so the
+    reported `stats` are overridden by the deterministic `agreement` block when
+    they are missing.
+    IMPORTANT (live): method="usmn" returns SA's WEIGHTED network solution, NOT
+    the arithmetic mean - on the fixture it sits rms 0.0264 mm (max 0.0499) off
+    the mean of the same groups, no setting makes it the mean, and the solve
+    also relocates the instruments of the job (measured: up to 0.035 mm) so the
+    source groups themselves move. If you want the plain average of the groups
+    - LSQ-aligned, with everything left where it is - use method="fit": it
+    reproduces an independently computed arithmetic mean to 0.000000 mm and
+    moves nothing. Neither path does USMN's iterative outlier rejection except
+    method="usmn" with auto_reject=True.
+    The `agreement` block is computed here: the 3-D distance from every source
+    point to its merged counterpart, matched by target name, overall and per
+    source group.
+
+    Args: source_groups: the groups to unify (full 'A::G' or bare names in
+          `collection`); result_group: the merged output group; method: "usmn"
+          | "fit"; auto_reject: iterative outlier rejection (USMN AutoReject;
+          for "fit" it is accepted but not applied - use sa_fit_clean per
+          group); instruments: explicit instrument list ('A::0'); default derives
+          them from the source groups' observations; reference_group: "fit" only
+          - the group the others are aligned to (default: the first source);
+          exclude_other_groups: "usmn" only - exclude every other point group of
+          the collection; exclude_single_observation: "usmn" only -
+          'Exclude Points Measured By Only One Instrument';
+          rms_tolerance / max_tolerance: USMN accept thresholds (0.0 = the step
+          reports without failing); max_attempts: USMN retries; collection:
+          resolves bare names and receives the result ('' = active);
+          delete_existing: replace a same-named result group.
+
+    Returns {unified, method, result_group, source_groups, instruments,
+             groups_excluded, result_count, stats {rms, max_absolute},
+             agreement {overall {rms, max_absolute, pairs}, by_group {...}},
+             alignment (method="fit" only), reference_group, attempts, replaced,
+             status_code, status, messages, error?}."""
+    src_full = [_object_full_name(g, collection) for g in (source_groups or [])]
+    res_full = _object_full_name(result_group, collection)
+    res = {
+        "unified": False,
+        "method": method,
+        "result_group": res_full,
+        "source_groups": src_full,
+        "instruments": [],
+        "groups_excluded": [],
+        "result_count": 0,
+        "stats": {"rms": None, "max_absolute": None},
+        "agreement": None,
+        "alignment": None,
+        "reference_group": None,
+        "attempts": 0,
+        "replaced": False,
+        "status_code": None,
+        "status": None,
+        "messages": [],
+        "error": None,
+    }
+    if not result_group:
+        res["error"] = "result_group is required."
+        return res
+    if len(src_full) < 2:
+        res["error"] = ("At least two source groups are required - unifying a "
+                        "single group has nothing to align.")
+        return res
+    if method not in _UNIFY_METHODS:
+        res["error"] = (f"Unknown method '{method}' - use one of "
+                        f"{list(_UNIFY_METHODS)}.")
+        return res
+    try:
+        _ensure_sa()
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+        return res
+
+    if delete_existing:
+        d = sa_delete(objects=[res_full])
+        res["replaced"] = bool(d.get("objects_deleted"))
+        if d.get("error"):
+            res["messages"].append(f"delete-before-create: {d['error']}")
+
+    try:
+        if method == "usmn":
+            _unify_usmn(res, src_full, res_full, instruments, auto_reject,
+                        exclude_other_groups, exclude_single_observation,
+                        rms_tolerance, max_tolerance, max_attempts)
+        else:
+            _unify_fit(res, src_full, res_full, reference_group, auto_reject)
+        if res["unified"]:
+            try:
+                res["agreement"] = _group_agreement(
+                    res["source_groups"], res_full)
+                overall = res["agreement"]["overall"]
+                if overall["rms"] is not None and not (
+                        res["stats"].get("rms")):
+                    res["stats"]["rms"] = overall["rms"]
+                if overall["max_absolute"] is not None and not (
+                        res["stats"].get("max_absolute")):
+                    res["stats"]["max_absolute"] = overall["max_absolute"]
+            except Exception as exc:  # noqa: BLE001
+                res["messages"].append(f"agreement stats failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        res["error"] = str(exc)
+    return res
+
+
+def _unify_usmn(res, src_full, res_full, instruments, auto_reject,
+                exclude_other_groups, exclude_single_observation,
+                rms_tolerance, max_tolerance, max_attempts):
+    """USMN path: solve the network and let SA write the composite group."""
+    if instruments:
+        res["instruments"] = [str(i) for i in instruments]
+    else:
+        for group in src_full:
+            for inst in _instruments_on_group(group):
+                if inst not in res["instruments"]:
+                    res["instruments"].append(inst)
+        if not res["instruments"]:
+            res["error"] = ("No instrument has observations on the source "
+                            "groups' points - USMN cannot solve a network. "
+                            "Pass `instruments` explicitly or use method='fit'.")
+            return
+    if exclude_other_groups:
+        coll = res_full.split("::", 1)[0] if "::" in res_full else ""
+        if not coll:
+            coll = _co_name_parts(src_full[0])[0]
+        for group in _objects_in_collection_by_type(coll, "Point Group"):
+            if group not in src_full and group not in res["groups_excluded"]:
+                res["groups_excluded"].append(group)
+
+    coll, out = _co_name_parts(res_full)
+    last_code = None
+    for attempt in range(1, max(1, int(max_attempts)) + 1):
+        res["attempts"] = attempt
+        sa_delete(objects=[res_full])
+        sa.set_step("Locate Instruments (USMN)")
+        sa.set_col_inst_id_ref_list_arg("Instruments to Locate",
+                                        res["instruments"])
+        sa.set_collection_object_name_arg(
+            "Nominals Group Name (blank for none)", "", "")
+        sa.set_collection_object_name_arg(
+            "Output Group Name (to be established)", coll, out)
+        sa.set_bool_arg("AutoReject Outliers and Resolve", bool(auto_reject))
+        sa.set_double_arg("Max Acceptable RMS Error Value (0.0 for none)",
+                          float(rms_tolerance))
+        sa.set_double_arg("Max Acceptable Error Value (0.0 for none)",
+                          float(max_tolerance))
+        sa.set_collection_object_name_ref_list_arg("Groups to be Excluded",
+                                                   res["groups_excluded"])
+        sa.set_bool_arg("Exclude Points Measured By Only One Instrument",
+                        bool(exclude_single_observation))
+        sa.execute_step()
+        last_code = sa.get_step_result()
+        res["status_code"] = last_code
+        res["status"] = MP_STATUS.get(last_code, f"Unknown({last_code})")
+        res["messages"] += _safe_messages()
+        count = len(_points_in_group(res_full))
+        res["result_count"] = count
+        if last_code == 2 and count > 0:
+            for key, arg in (("rms", "RMS Error Value"),
+                             ("max_absolute", "Max Error Value")):
+                try:
+                    res["stats"][key] = sa.get_double_arg(arg)
+                except Exception:  # noqa: BLE001
+                    pass
+            res["unified"] = True
+            return
+    res["error"] = (
+        f"'Locate Instruments (USMN)' returned "
+        f"{MP_STATUS.get(last_code, last_code)} (code {last_code}) on all "
+        f"{res['attempts']} attempt(s) and no group '{res_full}' was created. "
+        f"Check that the instruments ({res['instruments']}) share targets; "
+        f"a group reusing target names makes USMN fail silently - list it in "
+        f"`exclude_other_groups`/`groups_to_exclude`.")
+
+
+def _unify_fit(res, src_full, res_full, reference_group, auto_reject):
+    """Fallback path: copy the sources, LSQ-align the copies, average them."""
+    res["alignment"] = {}
+    res["reference_group"] = (_object_full_name(reference_group,
+                                                _co_name_parts(src_full[0])[0])
+                              if reference_group else src_full[0])
+    if res["reference_group"] not in src_full:
+        src_full = [res["reference_group"]] + src_full
+        res["source_groups"] = src_full
+    if auto_reject:
+        res["messages"].append(
+            "method='fit' aligns and averages only - the iterative outlier "
+            "rejection is USMN's ('AutoReject Outliers and Resolve'); use "
+            "sa_fit_clean to drop outliers per group.")
+
+    coll = _co_name_parts(res_full)[0] or _co_name_parts(src_full[0])[0]
+    temp = {}
+    for i, group in enumerate(src_full):
+        name = f"MCP_UNIFY_{i}"
+        temp[group] = (f"{coll}::{name}" if coll else f"::{name}")
+    try:
+        for group, dest in temp.items():
+            if _copy_object(group, dest) not in (2, 4):
+                raise SAError(f"Could not copy '{group}' to '{dest}'.")
+        for group in src_full:
+            if group == res["reference_group"]:
+                res["alignment"][group] = {"reference": True, "rms": 0.0,
+                                           "max_absolute": 0.0}
+                continue
+            code, rms, mx, matrix = _group_to_group_transform(
+                temp[res["reference_group"]], temp[group])
+            entry = {"reference": False, "status_code": code, "rms": rms,
+                     "max_absolute": mx, "transform": matrix}
+            res["alignment"][group] = entry
+            if code not in (2, 4) or not matrix:
+                raise SAError(
+                    f"'Best Fit Transformation - Group to Group' returned "
+                    f"{MP_STATUS.get(code, code)} (code {code}) for '{group}' "
+                    f"against '{res['reference_group']}'.")
+            if _apply_delta_transform(temp[group], matrix) not in (2, 4):
+                raise SAError(f"Could not apply the alignment to '{group}'.")
+        avg = sa_average_groups(source_groups=list(temp.values()),
+                                result_group=res_full,
+                                delete_existing=False)
+        res["status_code"] = avg.get("status_code")
+        res["status"] = avg.get("status")
+        res["messages"] += avg.get("messages") or []
+        res["result_count"] = avg.get("result_count") or 0
+        res["unified"] = res["result_count"] > 0
+        stats = avg.get("stats") or {}
+        res["stats"] = {"rms": stats.get("rms"),
+                        "max_absolute": stats.get("max_absolute")}
+        if not res["unified"]:
+            res["error"] = avg.get("error") or (
+                f"'Average a set of Groups' created no group '{res_full}'.")
+    finally:
+        leftover = [g for g in temp.values() if g != res_full]
+        if leftover:
+            sa_delete(objects=leftover)
 
 
 # ---------------------------------------------------------------------------
