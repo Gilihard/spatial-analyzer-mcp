@@ -4,6 +4,15 @@ import sys as _sys
 # runnable as a plain script from anywhere: put the repo root on sys.path
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+# The check labels below carry non-ASCII text; a cp1252/cp866 console (CI
+# runner, Russian Windows) would otherwise crash on print with
+# UnicodeEncodeError. Replace unencodable characters instead of raising.
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 import math
 import random
 import sys
