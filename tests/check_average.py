@@ -5,8 +5,14 @@ setter TYPES, the delete-before-create ordering and the "success is decided by
 the result group's content" rule. The live half (the mean really is the
 arithmetic mean, matching is by target name) is covered by _live_average.py.
 
-Run: python _t_average.py
+Run: python tests/check_average.py
 """
+
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import server
 

@@ -5,8 +5,14 @@ No SA, no COM: exercises the transform-matrix helpers (_matrix_to_nested /
 _variant_to_matrix / _matrix_variant) and the input validation of
 sa_move_objects / sa_object_transform (the COM half is covered by
 _live_transform.py).
-Run: python _t_move.py
+Run: python tests/check_move.py
 """
+
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import pythoncom
 

@@ -5,10 +5,16 @@ that sa_app.dismiss_sa_dialogs closes them (WM_CLOSE and/or button click),
 exactly the path the MCP watchdog uses on SA's blocking modals. A MessageBox
 is a real #32770 dialog, so this exercises the same Win32 code.
 
-Run: python _t_dialogs.py
+Run: python tests/check_dialogs.py
 """
 
 from __future__ import annotations
+
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import ctypes
 import os

@@ -11,8 +11,14 @@ Pins the contract that was hard-won live:
   - method='fit' copies every source, fits each copy onto the reference,
     applies the transform, averages the COPIES, then deletes them;
   - validation returns before any COM call.
-Run: python _t_unify.py
+Run: python tests/check_unify.py
 """
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import server
 
 fails = []

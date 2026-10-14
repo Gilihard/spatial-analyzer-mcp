@@ -3,18 +3,18 @@
 Concise operating guide for AI agents editing this repo. Tool-by-tool docs
 live in `server.py` docstrings + `README.md`; this file carries the
 **load-bearing knowledge**: the hard-won rules and the confirmed SA step/arg
-names. Facts marked **live** were verified against SA 2015.07.28; **PDF**
-means taken from `Documentation\MP Command Reference.pdf` (printed page N ≈
-PDF page N+25; grep-able copy at `mp_ref.txt`) and possibly not yet
-live-checked.
+names. Facts marked **live** were verified against SA 2015.07.28 on a real
+measurement job; **PDF** means taken from the *MP Command Reference* shipped
+with SA (`Documentation\MP Command Reference.pdf`, printed page N ≈ PDF page
+N+25) and possibly not yet live-checked.
 
 ## What this is
 An MCP server letting an LLM drive **SpatialAnalyzer (SA)** through its COM
 SDK. SA automation is **step-based**, not a flat function API:
 `SetStep("<exact name>")` → `Set<Type>Arg("<arg>", value)` → `ExecuteStep()`
 → `Get<Type>Arg(...)` / `GetMPStepResult()`. Step + arg names live in SA's MP
-tree, the SDK examples folder (`...\SA SDK\Examples\`), the PDF, and
-`mp_ref.txt`; **copy the exact names** from there. Step result codes: 2
+tree, the SDK examples folder (`...\SA SDK\Examples\`) and the PDF; **copy
+the exact names** from there. Step result codes: 2
 DoneSuccess, 4 minor/partial, 3 fatal (may still have done the work — see
 Query steps), -1 SdkError (usually a wrong step/arg name).
 
@@ -93,7 +93,7 @@ Query steps), -1 SdkError (usually a wrong step/arg name).
    and `sa_dialog_watchdog start|stop|status` (armed by `_ensure_bridge`;
    interval env `SA_MCP_WATCHDOG_INTERVAL`, default 0.5 s; optional
    `title_contains`). A dialog that pops between steps is cured by the next
-   step blocking on it. Offline regressions: `_t_dialogs.py`, `_t_openlogic.py`.
+   step blocking on it. Offline regressions: `tests/check_dialogs.py`, `tests/check_openlogic.py`.
 6. **Nothing may run between the `Set*Arg` calls of a step and its
    `ExecuteStep()`.** Any other step that *executes* re-arms the engine's
    current step, so the following `ExecuteStep()` runs THAT step instead and
@@ -159,34 +159,33 @@ Query steps), -1 SdkError (usually a wrong step/arg name).
 - Bridge tests: `python test_sdk.py` (no SA) / `python test_sdk.py localhost`
   (live SA running).
 - Syntax: `python -m py_compile sa_sdk.py sa_app.py server.py test_sdk.py`.
-- Offline regressions (no SA/COM): `python _t_dialogs.py` (dialog close),
-  `_t_openlogic.py` (watchdog gate + attach logic), `_t_identify.py`
-  (shape classification), `_t_frames_delete.py` (delete/frame/СК logic +
+- Offline regressions (no SA/COM): `python tests/check_dialogs.py` (dialog close),
+  `tests/check_openlogic.py` (watchdog gate + attach logic), `tests/check_identify.py`
+  (shape classification), `tests/check_frames_delete.py` (delete/frame/СК logic +
   `Construct Frame` arg-setter/ordering/active-collection contract),
-  `_t_fitmath.py` (fixed-fit math), `_t_cardinal_logic.py` (cardinal purge),
-  `_t_move.py` (transform matrix transport + move-mode validation),
-  `_t_average.py` (group-averaging arg names/setter types/ordering),
-  `_t_unify.py` (USMN arg contract + retry, exclusion derivation, `fit`
-  pipeline ordering + temp cleanup), `_t_fit_transform.py` (sa_best_fit_transform
+  `tests/check_fitmath.py` (fixed-fit math), `tests/check_cardinal_logic.py` (cardinal purge),
+  `tests/check_move.py` (transform matrix transport + move-mode validation),
+  `tests/check_average.py` (group-averaging arg names/setter types/ordering),
+  `tests/check_unify.py` (USMN arg contract + retry, exclusion derivation, `fit`
+  pipeline ordering + temp cleanup), `tests/check_fit_transform.py` (sa_best_fit_transform
   arg/DOF contract, deviation math + worst-first sort, the exclude→temp-copy→
   refit path incl. the ineffective-delete guard, apply + `stats_after_move`).
   All of
   them force the offline path themselves (`no_sa` / a fake bridge), so they
   stay deterministic even when a live SA is up — do not make a regression
   depend on SA actually being closed.
-- Live harnesses (SA free, no other engine connected): `_live_vectors.py`
-  (compare/vector groups), `_live_frames_delete.py` (delete/frame/СК),
-  `_live_transform.py` (move/transform: matrix round-trip, translation,
-  rotation pivot, world, frame-to-frame, pose read-back), `_live_proj.py`
-  (projection), `_live_showhide.py`, `_live_fixed2.py` / `_live_fixed3.py`
-  (fixed fits), `_live_average.py` (group averaging; boots SA with the fixture
-  itself, verifies the mean against a Python one), `_live_unify.py`
-  (`sa_unify_groups` both methods, each on a fresh copy of the fixture, then
-  compares the two composites and checks for leftover `MCP_UNIFY*` temps),
-  `_live_fit_transform.py` (`sa_best_fit_transform`: the МНК transform's
-  direction + our recomputed RMS against the step's own, the
-  exclude→refit collapse, apply + companion move).
-  Keep one engine alive; cleanup MCP_* objects.
+- Live harnesses are **not part of this repo**: they need a licensed SA
+  install and a real job, so they are kept outside it (an unpublished
+  `_live_*.py` set). What they covered, each run against a real SA with one
+  engine alive and the `MCP_*` objects cleaned up: compare/vector groups,
+  delete/frame, move/transform (matrix round-trip, translation, rotation
+  pivot, world, frame-to-frame, pose read-back), projection, show/hide, fixed
+  fits, group averaging (boots SA itself and verifies the mean against a
+  Python one), `sa_unify_groups` both methods (each on a fresh copy of the
+  fixture, then compares the composites and checks for leftover `MCP_UNIFY*`
+  temps) and `sa_best_fit_transform` (the МНК transform's direction, our
+  recomputed RMS against the step's own, the exclude→refit collapse, apply +
+  companion move).
 - SA 2015 serves ONE SDK client at a time (live 2026-09-10): a second process
   calling `_ensure_sa()` gets `Connect` True with an EMPTY job (or Connect
   fails), and repeatedly spawning engines wedges the listener. So a live
@@ -332,8 +331,8 @@ averaged": matching is by TARGET name, the group prefix is ignored (live:
 «network»/`NetA`/`NetB` → one point per target
 1…6; target 5 present in only 2 of the 3 groups was averaged over those 2).
 The result INHERITS the source target names and its coordinates are a plain
-ARITHMETIC mean (verified to ~1e-13 mm against a Python mean in
-`_live_average.py`). The three returned deviations are the WORST POINT's
+ARITHMETIC mean (verified live to ~1e-13 mm against a Python mean). The
+three returned deviations are the WORST POINT's
 RMS / mean / max distance to its own averaged point — NOT whole-merge
 aggregates (SA's RMS equalled the worst target's per-target RMS exactly), and
 the tolerances are judged on those same worst-point values. Statuses are
@@ -549,8 +548,9 @@ Deviation`.
   `Get Working Transform of Object (Fixed XYZ)` (in `Object Name`).
 - Transform transport (see non-negotiable #3): `sa_sdk._matrix_variant()` —
   `VARIANT(VT_ARRAY | VT_R8, nested4x4)` under a `VT_VARIANT|VT_BYREF`
-  descriptor. Regression `_t_move.py` pins the declared type; `_live_transform.py`
-  proves the round-trip (translation lands in matrix column 3, bottom row
+  descriptor. Regression `tests/check_move.py` pins the declared type; the
+  live harness proved the round-trip (translation lands in matrix column 3,
+  bottom row
   0 0 0 1, angles exact in degrees).
 - **SA never overwrites**: `sa_move_objects` moves in place (no copy, no new
   name); a partial code 4 means at least one named object was not found
@@ -627,8 +627,8 @@ Points` — in `Point Names`, `Show? (Hide = FALSE)` (always succeeds).
 name → SdkError -1), `Object Type To Show/Hide` (enum), `Hide? (Show =
 FALSE)`. No scope = current/active collection.
 
-## Fit quality & robust rebuild (live on `job.xit`,
-collection "A", group «cloud», 400 pts, SMR 19.05)
+## Fit quality & robust rebuild (live on a real job,
+collection "A", group «cloud», ~400 pts, SMR 19.05)
 - **Reflector compensation.** SA measures to the reflector CENTRE; `Get Point
   Properties` → `Radial Offset` stores the reflector radius (19.05 mm =
   3/4" SMR; all 400 pts), so raw points sit ~19.05 mm OUTSIDE the fitted
@@ -674,7 +674,7 @@ collection "A", group «cloud», 400 pts, SMR 19.05)
   high verdict; on flat/collinear clouds the degenerated curved rivals drop
   out of the confidence pool. `recognized: False` when the winning residual
   is large vs cloud size; a pile of coincident points is rejected ("no
-  extent"). Regression `_t_identify.py`.
+  extent"). Regression `tests/check_identify.py`.
 - **Fixed fits** (`sa_fit_fixed*`): no SA step constrains a parameter →
   constrained LSQ offline (Levenberg-Marquardt on compensated surface
   residual) then create the object via `Construct <Type>` so it carries the
@@ -682,7 +682,7 @@ collection "A", group «cloud», 400 pts, SMR 19.05)
   both (circles). **Key semantics:** with stored offsets the free-fit radius
   Rf is the reflector-CENTRE radius — pass the TRUE-surface radius (≈ Rf ∓
   stored offset) to a fixed fit; the side picks the sign. Regression
-  `_t_fitmath.py`.
+  `tests/check_fitmath.py`.
 
 ## Attach-first job open (live semantics)
 SA's SDK cannot report the loaded file (verified against the SDK headers +
@@ -699,7 +699,7 @@ fails → skipped) → SDK `Open SA File` → on failed open OR failed Connect
 while SA runs (wedged listener): force-restart (`sa_app.kill_sa` + bridge
 reset + relaunch SA with the file) — a restart discards the previous job's
 unsaved changes; that is the sanctioned last resort. `sa_current_file()`
-reports the evidence. Regression `_t_openlogic.py`.
+reports the evidence. Regression `tests/check_openlogic.py`.
 
 ## Status / next steps
 Live-confirmed: connect/launch/open/import/inspect, all 6 best fits, the
@@ -708,20 +708,20 @@ whole fit-quality chain (props readback, compensated deviations, outliers,
 radius read back exactly; side argument discriminates ~57× in RMS), view
 show/hide, deletion, frames/СК basics (frame on fitted plane + replace,
 activate + read-back + reset WORLD, two-point СК, point/object deletion),
-move/transform (`_live_transform.py` ALL OK — matrix transport round-trip,
+move/transform (matrix transport round-trip,
 translation, rotation about the active frame's origin, world mode with scale,
-frame-to-frame, pose read-back), projection (`_live_proj.py` ALL OK),
-best-fit transform МНК (`_live_fit_transform.py` ALL OK — our recomputed RMS
-matched the step's own to ~7 significant digits, exclude→refit collapsed the
+frame-to-frame, pose read-back), projection,
+best-fit transform МНК (our recomputed RMS matched the step's own to ~7
+significant digits, exclude→refit collapsed the
 inlier RMS to 0.0 on the planted-outlier fixture, apply moved the group + a
 companion onto the reference),
-attach-first open, modal watchdog, group averaging (`_live_average.py` PASS —
-3 groups -> «Average», arithmetic mean exact to ~1e-13 mm), USMN unify
+attach-first open, modal watchdog, group averaging
+(3 groups -> «Average», arithmetic mean exact to ~1e-13 mm), USMN unify
 (`sa_unify_groups`: `Locate Instruments (USMN)` with AutoReject solved the
 fixture's three groups -> 6-point composite, instruments auto-derived,
 colliding groups auto-excluded; `method="fit"` verified separately).
-PDF-named, NOT yet live: compare/vector-group trio + vector style
-(`_live_vectors.py` pending). Compare min point counts per fit type:
+PDF-named, NOT yet live: compare/vector-group trio + vector style. Compare
+min point counts per fit type:
 `_LIST_FIT_MIN_POINTS` (line 2 … cone 6).
 Still open on USMN: the `Show USMN Dialog` enum spellings (unused — the engine
 does not pop the dialog under SDK control) and step text messages (unreadable,
@@ -729,5 +729,6 @@ see non-negotiable #7).
 To extend: exports/reports, a USMN run WITH real instrument movements /
 nominals (`sa_unify_groups` deliberately passes blank nominals and solves
 in-place), point/group manipulation beyond delete/construct/move — copy step
-names from the PDF / SDK examples and confirm live. Live check on a real job:
-`job.xit` (collection "A", group «cloud» 400 pts).
+names from the PDF / SDK examples and confirm live. Every "live" fact above
+comes from runs against real jobs (collection "A", group «cloud», ~400 pts,
+SMR 19.05).

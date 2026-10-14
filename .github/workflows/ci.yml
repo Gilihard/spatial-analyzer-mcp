@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  offline-checks:
+    name: offline checks (py ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile every module
+        run: >
+          python -m py_compile
+          sa_app.py sa_fitmath.py sa_sdk.py server.py build_mcp.py test_sdk.py
+          tests/run_all.py
+
+      # No SpatialAnalyzer and no COM engine: every check forces the offline path
+      # itself, so this also works on a CI runner with no SA installed. The
+      # dialog check is skipped - a runner has no interactive desktop session.
+      - name: Offline regression checks
+        env:
+          SAMCP_SKIP_CHECKS: check_dialogs.py
+        run: python tests/run_all.py

@@ -5,6 +5,12 @@ Mocks the two COM-backed helpers so only the name-filtering + delete-selection
 logic is exercised, against the exact naming SA 2015 produced live
 ("<geometry name>Кардинальные точки").
 """
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import server
 
 CALLS = []

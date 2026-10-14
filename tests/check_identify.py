@@ -14,8 +14,14 @@ pick, confidence and notes for each case. Expected picks:
   line        -> line          (collinear)
   shortbore   -> cylinder      (r=50, L=4 -> still volumetric)
   box         -> recognized False / a "not a single primitive" note
-Run:  python _t_identify.py
+Run:  python tests/check_identify.py
 """
+
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import math
 import random

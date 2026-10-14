@@ -1,5 +1,6 @@
 # MCP server runtime
-mcp[cli]>=1.0
+# (<2 on purpose: mcp 2.x renamed mcp.server.fastmcp -> mcp.server.mcpserver)
+mcp[cli]>=1.0,<2
 
 # Windows COM bridge to SpatialAnalyzer SDK
 pywin32>=306

@@ -1,8 +1,14 @@
 """Offline regression for the attach-first current-file detection.
 
 No SA, no COM: exercises server._current_open_evidence / _track_open /
-sa_current_file with a mocked SA main-window caption. Run: python _t_openlogic.py
+sa_current_file with a mocked SA main-window caption. Run: python tests/check_openlogic.py
 """
+
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import os
 
