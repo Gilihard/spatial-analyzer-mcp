@@ -12,8 +12,6 @@ metrology package — through its COM SDK: inspect a measurement job, fit
 geometry, align and average point groups, build frames, move objects and read
 deviations back, all as tool calls.
 
-![SA SDK connection-error dialog](docs/img/sa-sdk-10061.png)
-
 ## Why this is not a thin wrapper
 
 SA is not a function API — it is a **step machine**: you name a step, set its
@@ -199,11 +197,16 @@ job) are deliberately not part of this repository.
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| `NRKSocketInterface::Connect Socket Connection Error = 10061` (see screenshot above) | The SDK engine started before SA's SDK listener was up, and it now blocks every later `Connect`. Close SA, `taskkill /F /IM SpatialAnalyzerSDK.exe`, start SA again (Utilities -> SDK Settings enabled) and retry. A 10061 right after a cold start is often just "listener not bound yet" — retry before assuming a wedge. |
+| `NRKSocketInterface::Connect Socket Connection Error = 10061` | The SDK engine started before SA's SDK listener was up, and it now blocks every later `Connect`. Close SA, `taskkill /F /IM SpatialAnalyzerSDK.exe`, start SA again (Utilities -> SDK Settings enabled) and retry. A 10061 right after a cold start is often just "listener not bound yet" — retry before assuming a wedge. |
 | Every step returns empty results on a loaded job | The engine is unconnected: it silently no-ops steps. Check `sa_status`, then let a tool re-bootstrap the bridge. |
 | `pywin32` import error | `python Scripts\pywin32_postinstall.py -install` |
 | A `.xit` path with non-ASCII characters is "not found" | Never type such a path inline into a REPL over a pipe (console codepage mangles the bytes) — read it from a UTF-8 file or pass a programmatic value. |
 | A tool "succeeded" but nothing appeared in SA | A step argument name was silently ignored: a `Set*Arg` setter returns `True` even for a bogus argument name. Copy the exact names from SA's MP tree or the MP Command Reference. |
+
+If you have never seen it, the 10061 dialog looks like this (localized by the
+Windows language, the text is just "connection refused"):
+
+![SA SDK connection-error dialog](docs/img/sa-sdk-10061.png)
 
 ## Extending
 
