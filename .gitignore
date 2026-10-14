@@ -1,7 +1,23 @@
 # Python
 __pycache__/
 *.py[cod]
+.venv/
+venv/
 
-# SpatialAnalyzer job/data files (real measurement data — not committed)
+# SpatialAnalyzer job/data files
 *.xit
 *.xit64
+
+# Scratch output
+*.log
+*_err.txt
+panels_*
+_dump_*.py
+_rows_*.py
+
+# Tooling / editor / OS
+.zcode/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

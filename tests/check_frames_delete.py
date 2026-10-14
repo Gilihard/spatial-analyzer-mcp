@@ -4,8 +4,14 @@
 No SA, no COM: exercises the name normalization and input validation of
 sa_delete / sa_create_frame / sa_set_working_frame / sa_current_working_frame
 (the COM half is covered by _live_frames_delete.py, pending live SA).
-Run: python _t_frames_delete.py
+Run: python tests/check_frames_delete.py
 """
+
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import server
 

@@ -1,3 +1,9 @@
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import math
 import random
 import sys

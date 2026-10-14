@@ -18,8 +18,14 @@ Pins the contract a live run cannot cheaply re-check:
     'Transform Objects by Delta (About Working Frame)', never the reference
     group, and verify_after_move measures where the group actually landed;
   - validation returns before any COM call.
-Run: python _t_fit_transform.py
+Run: python tests/check_fit_transform.py
 """
+
+import os as _os
+import sys as _sys
+
+# runnable as a plain script from anywhere: put the repo root on sys.path
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import server
 
